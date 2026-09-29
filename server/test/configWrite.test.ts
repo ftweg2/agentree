@@ -274,7 +274,41 @@ test('agent 定义：不认识的 frontmatter 字段和注释原样保留、顺�
   const out = read(file).toString();
   assert.ok(out.startsWith(expected.slice(0, expected.indexOf('tools:'))), 'tools 之前的内容不变');
   assert.ok(!out.includes('tools:') && !out.includes('  - Read'), 'tools 传 null 时删除这个字段（包括列表续行）');
-  assert.ok(out.endsWith('---\r\nNew prompt.\r\n\r\n---\r\n\r\nStill body.\r\n'), '正文按文件的 CRLF 写入');
+  assert.ok(out.endsWith('---\r\n\r\nNew prompt.\r\n\r\n---\r\n\r\nStill body.\r\n'), '正文按文件的 CRLF 写入，frontmatter 后的分隔空行保留');
+  // 读出来的正文不含分隔空行；原样提交回去不算改动
+  const d3 = (await call('GET', `/api/config/agent?path=${encodeURIComponent(file)}`, undefined, H)).body;
+  assert.equal(d3.body, 'New prompt.\r\n\r\n---\r\n\r\nStill body.\r\n');
+  const same = await plan([{ type: 'agent.upsert', scope: 'user', projectCwd: null, name: 'reviewer', originalName: null, fields: { description: d3.description, model: d3.model, effort: d3.effort, tools: d3.tools }, body: d3.body, baseHash: d3.hash }]);
+  assert.equal(same.changes.length, 0, '原样提交不算修改');
+});
+
+test('agent 定义：新建后读回的正文和提交的一致（不带分隔空行），from-config 的 prompt 也一致；再提交不算改动', async () => {
+  const body = '你是执行者。\n\n- 只改要求的范围\n';
+  const { result } = await planAndApply([{ type: 'agent.upsert', scope: 'user', projectCwd: null, name: 'worker', originalName: null, fields: { description: '干活', model: null, effort: null, tools: null }, body, baseHash: null }]);
+  const file = path.join(agentsDir, 'worker.md');
+  assert.equal(read(file).toString(), `---\nname: worker\ndescription: "干活"\n---\n\n${body}`, '文件里 frontmatter 和正文之间空一行');
+  const d = (await call('GET', `/api/config/agent?path=${encodeURIComponent(file)}`, undefined, H)).body;
+  assert.equal(d.body, body, '读回的正文没有多出开头的空行');
+  // 从配置生成预设时的 prompt 也是一样的（这个测试的 app 没有真实的 analyzer，直接调函数）
+  const { configSnapshot, presetFromConfig } = await import('../src/claudeConfig.ts');
+  assert.equal(presetFromConfig(await configSnapshot([]), null).agents.find((a) => a.name === 'worker')!.prompt, body);
+  const same = await plan([{ type: 'agent.upsert', scope: 'user', projectCwd: null, name: 'worker', originalName: null, fields: { description: '干活', model: null, effort: null, tools: null }, body, baseHash: d.hash }]);
+  assert.equal(same.changes.length, 0);
+  // 提示词自己以空行开头：只去掉分隔的那一行，多出来的空行属于提示词
+  const p = await planAndApply([{ type: 'agent.upsert', scope: 'user', projectCwd: null, name: 'worker', originalName: null, fields: { description: '干活', model: null, effort: null, tools: null }, body: '\n开头有空行\n', baseHash: d.hash }]);
+  assert.equal(read(file).toString(), '---\nname: worker\ndescription: "干活"\n---\n\n\n开头有空行\n');
+  assert.equal((await call('GET', `/api/config/agent?path=${encodeURIComponent(file)}`, undefined, H)).body.body, '\n开头有空行\n');
+  void p;
+  void result;
+});
+
+test('PUT /api/preset：agent 名字不合法（含空格、路径穿越、Windows 保留名）-> 400，不保存', async () => {
+  for (const name of ['bad name!', '../evil', 'nul', 'a/b']) {
+    const r = await call('PUT', '/api/preset', { version: 1, main: { model: null, effort: null, autoCompactWindow: null }, advisor: { model: null }, agents: [{ name, model: null, effort: null }], allowBuiltins: true, updatedAt: null });
+    assert.equal(r.status, 400, name);
+    assert.match(r.body.error, /agents\[0\]\.name 不合法/, name);
+  }
+  assert.equal((await call('GET', '/api/preset', undefined, H)).body.agents.length, 0, '没有保存');
 });
 
 test('agent 定义：新建（值含冒号 / 井号加引号）、同名拒绝、内置名拒绝、改名、删除和恢复', async () => {

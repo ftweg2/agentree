@@ -332,6 +332,51 @@ test('applied.json 的 wrote：这次写了记这次的值；null 且 prune 记 
   assert.equal(pl.presetApply?.includeRule, false);
 });
 
+test('applied.json 的 wrote 只记 agentree 真正写过的键：用户自己写的值永远不删；agentree 写的值再次应用没改动时仍记着，之后能删', async () => {
+  const withKeys = { model: 'claude-sonnet-5', advisor: { model: 'fable' }, autoCompactWindow: 500_000 };
+  const specified = preset({ main: { model: withKeys.model, effort: 'high', autoCompactWindow: withKeys.autoCompactWindow }, advisor: withKeys.advisor });
+  // 1. 文件里本来就有这些值（不是 agentree 写的）：应用没有改动，wrote 里不记；之后方案改成 null 并 prune，一个都不删
+  fs.writeFileSync(settingsPath, '{\n  "model": "claude-sonnet-5",\n  "advisorModel": "fable",\n  "effortLevel": "high",\n  "autoCompactWindow": 500000\n}\n');
+  const p1 = plan(specified, { prune: true }, null);
+  assert.equal(p1.plan.changes.length, 0, '值都已经是方案的值：不写');
+  assert.deepEqual(p1.presetApply?.wrote, { model: null, advisorModel: null, effort: null, autoCompactWindow: null }, '没写过的键不进 wrote');
+  const p2 = plan(preset(), { prune: true }, { ...record({}), wrote: p1.presetApply!.wrote });
+  assert.equal(p2.plan.changes.length, 0, '用户自己的值一个都不删');
+  // 2. agentree 写的值：记进 wrote；之后 prune 会删
+  fs.writeFileSync(settingsPath, '{\n  "theme": "dark"\n}\n');
+  const p3 = plan(specified, { prune: true }, null);
+  assert.equal(p3.plan.changes.length, 1);
+  assert.deepEqual(p3.presetApply?.wrote, { model: 'claude-sonnet-5', advisorModel: 'fable', effort: { where: 'top', model: null, value: 'high' }, autoCompactWindow: 500_000 });
+  await applyPlan(p3, []);
+  // 3. 同样的方案再应用一次：没有改动，但这些值仍是 agentree 写的，wrote 保留；prune 时删掉
+  const p4 = plan(specified, { prune: true }, { ...record({}), wrote: p3.presetApply!.wrote });
+  assert.equal(p4.plan.changes.length, 0);
+  assert.deepEqual(p4.presetApply?.wrote, p3.presetApply?.wrote, '没改动的重复应用不丢记录');
+  const p5 = plan(preset(), { prune: true }, { ...record({}), wrote: p4.presetApply!.wrote });
+  assert.equal(p5.plan.changes[0].after, '{\n  "theme": "dark"\n}\n', 'agentree 写的四个键全部删掉');
+  assert.deepEqual(p5.presetApply?.wrote, { model: null, advisorModel: null, effort: null, autoCompactWindow: null });
+  // 4. 一半是用户的、一半是 agentree 写的：只删 agentree 写的
+  fs.writeFileSync(settingsPath, '{\n  "advisorModel": "fable"\n}\n');
+  const p6 = plan(specified, { prune: true }, null);
+  assert.equal(p6.presetApply?.wrote.advisorModel, null, 'advisorModel 是用户写的');
+  assert.equal(p6.presetApply?.wrote.model, 'claude-sonnet-5');
+  await applyPlan(p6, []);
+  const p7 = plan(preset(), { prune: true }, { ...record({}), wrote: p6.presetApply!.wrote });
+  assert.equal(p7.plan.changes[0].after, '{\n  "advisorModel": "fable"\n}\n', '只删 agentree 写的，用户的 advisorModel 保留');
+  // 5. 上次记录的值和文件里的不同（用户改过）、这次方案恰好等于文件里的值：不算 agentree 的
+  fs.writeFileSync(settingsPath, '{\n  "model": "claude-sonnet-5"\n}\n');
+  const p8 = plan(specified, { prune: false }, record({ model: 'claude-opus-5-5' }));
+  assert.ok(!p8.plan.changes.some((c) => /model/.test(c.summary) && !/autoCompactWindow|advisorModel|effort/.test(c.summary)));
+  assert.equal(p8.presetApply?.wrote.model, null, '记录的是 opus、现在是 sonnet：sonnet 是用户写的');
+});
+
+test('validatePreset：agent 名字不合法时报错（和写入时同一条规则）', () => {
+  for (const name of ['bad name!', '../evil', 'a/b', 'nul', 'COM1', '-x', 'x'.repeat(65)]) {
+    assert.throws(() => validatePreset(preset({ agents: [{ name, model: null, effort: null }] })), /agents\[0\]\.name 不合法/, name);
+  }
+  assert.doesNotThrow(() => validatePreset(preset({ agents: [{ name: 'code-reviewer_2', model: null, effort: null }] })));
+});
+
 test('prune 缺失或 false：行为和原来一样，只增改不移除', () => {
   fs.writeFileSync(settingsPath, USER_SETTINGS);
   for (const prune of [undefined, false]) {

@@ -155,6 +155,29 @@ export function parseAgentDoc(text: string, bom = false): AgentDoc {
   return { eol, bom, lines, fields, openLine: all[0], closeLine: all[close], closeEol, body };
 }
 
+/**
+ * 正文作为系统提示词。Claude Code 的约定是 frontmatter 和正文之间空一行，这个分隔用的空行属于文件格式、不属于提示词：
+ * 正文以一个空行开头时去掉恰好这一行（再多的空行是提示词自己的）。文件里没有分隔空行时原样返回
+ */
+export function promptOf(doc: AgentDoc): string {
+  const m = /^[ \t]*\r?\n/.exec(doc.body);
+  return m ? doc.body.slice(m[0].length) : doc.body;
+}
+
+/**
+ * 用系统提示词替换正文：文件原来有分隔空行的仍然保留，原来没有正文的补上一个（新建文件的写法）。
+ * 换行按文件的风格。提示词没变时不动，返回 false
+ */
+export function setPrompt(doc: AgentDoc, prompt: string): boolean {
+  const cur = promptOf(doc);
+  const next = prompt.replace(/\r?\n/g, doc.eol);
+  if (next === cur) return false;
+  const lead = doc.body === '' ? doc.eol : doc.body.slice(0, doc.body.length - cur.length);
+  doc.body = lead + next;
+  doc.closeEol = true;
+  return true;
+}
+
 export function getField(doc: AgentDoc, key: string): string | null {
   return doc.fields.find((f) => f.key === key)?.value ?? null;
 }

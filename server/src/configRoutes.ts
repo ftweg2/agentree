@@ -8,7 +8,7 @@ import { claudeConfigDirs } from './config.ts';
 import { applyPlan, PlanStore } from './config/applier.ts';
 import { listBackups } from './config/backups.ts';
 import { DEFAULT_RULE_TEXT, findRuleBlock, RuleBlockError } from './config/claudeMd.ts';
-import { FrontmatterError, getField, parseAgentDoc } from './config/frontmatter.ts';
+import { FrontmatterError, getField, parseAgentDoc, promptOf } from './config/frontmatter.ts';
 import { checkWritable, isConfigDirProject, isKnownProjectCwd, PathError, projectClaudeMdPath } from './config/paths.ts';
 import { makePlan, makeRestorePlan, type PlanContext } from './config/planner.ts';
 import { agentTemplateInfos, PRESET_TEMPLATES } from './config/templates.ts';
@@ -102,7 +102,7 @@ export function registerConfigRoutes(app: Hono, getKnownCwds: () => string[], pl
         effort: getField(doc, 'effort'),
         tools: getField(doc, 'tools'),
         projectCwd: target.projectCwd,
-        body: doc.body,
+        body: promptOf(doc),
         otherFields: doc.fields.map((x) => x.key).filter((k) => !MANAGED.has(k)),
         hash: f.hash!,
       };

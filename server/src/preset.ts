@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import type { Preset, PresetAgent, SchemeInfo, SchemeRef } from '../../shared/types.ts';
 import { agentreeHome, AUTO_COMPACT_MAX, AUTO_COMPACT_MIN, EFFORT_ORDER, isValidAutoCompactWindow } from './config.ts';
+import { PathError, validateAgentName } from './config/paths.ts';
 import { normalizeDir, schemeForSession } from './conformance.ts';
 
 export function defaultPreset(): Preset {
@@ -96,6 +97,13 @@ export function validatePreset(input: unknown): Preset {
     if (!a || typeof a !== 'object') throw new Error(`agents[${i}] 必须是对象`);
     const name = optStr(a.name, `agents[${i}].name`);
     if (!name) throw new Error(`agents[${i}].name 不能为空`);
+    // 和写入时同一条规则：名字就是定义文件名，不合法的名字连保存都不接受
+    try {
+      validateAgentName(name);
+    } catch (e) {
+      if (e instanceof PathError) throw new Error(`agents[${i}].name 不合法：${e.message}`);
+      throw e;
+    }
     if (seen.has(name)) throw new Error(`agents 里有重复的名字 ${name}`);
     seen.add(name);
     const pa: PresetAgent = {

@@ -6,7 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import type { AgentDefinition, CheckLevel, ClaudeConfigSnapshot, EnvCheck, Preset, PresetAgent } from '../../shared/types.ts';
 import { BUILTIN_AGENT_TYPES, claudeConfigDirs, isValidAutoCompactWindow } from './config.ts';
-import { parseAgentDoc, type AgentDoc } from './config/frontmatter.ts';
+import { parseAgentDoc, promptOf, type AgentDoc } from './config/frontmatter.ts';
 import { readTextFile } from './config/text.ts';
 
 // ---------------- frontmatter ----------------
@@ -319,7 +319,7 @@ function presetAgentsFrom(definitions: AgentDefinition[]): PresetAgent[] {
     const doc = readAgentDoc(d.filePath);
     if (doc) {
       pa.disallowedTools = doc.fields.find((f) => f.key === 'disallowedTools')?.value?.trim() || null;
-      pa.prompt = doc.body;
+      pa.prompt = promptOf(doc);
     }
     byName.set(d.name, pa);
   }

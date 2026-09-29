@@ -17,10 +17,10 @@ import type {
 } from '../../../shared/types.ts';
 import { AUTO_COMPACT_MAX, AUTO_COMPACT_MIN, BUILTIN_AGENT_TYPES, claudeConfigDirs, formatWindow, isValidAutoCompactWindow } from '../config.ts';
 import { modelFamily, normalizeModel, MODEL_ALIASES } from '../conformance.ts';
-import { sameTools, validatePreset, type AppliedRecord, type EffortLocation } from '../preset.ts';
+import { sameTools, validatePreset, type AppliedRecord, type EffortLocation, type WrittenEffort } from '../preset.ts';
 import { getBackup } from './backups.ts';
 import { DEFAULT_RULE_TEXT, disableRule, enableRule, findRuleBlock, RuleBlockError } from './claudeMd.ts';
-import { FrontmatterError, getField, newAgentText, parseAgentDoc, serializeAgentDoc, setField, type AgentDoc } from './frontmatter.ts';
+import { FrontmatterError, getField, newAgentText, parseAgentDoc, serializeAgentDoc, setField, setPrompt, type AgentDoc } from './frontmatter.ts';
 import { JsonEditError, nodeAt, parseJsonDoc, removeValue, setValue } from './jsonEdit.ts';
 import {
   agentFilePath,
@@ -202,18 +202,38 @@ export function changedSinceWriteNote(key: string, current: string): string {
   return `settings.json 的 ${key} 在 agentree 写入之后被改成了 ${current}，这次不会动它`;
 }
 
+/** 这次应用里 settings 的哪些键是 agentree 实际写入的（值有改动或新建）。文件里本来就是方案的值时不算写入 */
+export interface WrittenKeys {
+  model: boolean;
+  advisorModel: boolean;
+  effort: boolean;
+  autoCompactWindow: boolean;
+}
+const ALL_WRITTEN: WrittenKeys = { model: true, advisorModel: true, effort: true, autoCompactWindow: true };
+
+const sameEffort = (a: WrittenEffort, b: WrittenEffort) => a.where === b.where && a.model === b.model && a.value === b.value;
+
 /**
- * 应用成功后 applied.json 里的 wrote：
- * 这次写了的记这次的值；这次为 null 且 prune 了的记 null（删掉了，或者值被改过、已经不是 agentree 的）；
- * 没 prune 的保留上次的记录
+ * 应用成功后 applied.json 里的 wrote，只记 agentree 自己写过的值：
+ *   这次实际写了（written 里为 true）的记这次的值；
+ *   方案指定了、但文件里本来就是这个值（这次没写）的：上次记录的值和它相同才仍算 agentree 的，否则是用户自己写的，记 null，prune 永远不会删它；
+ *   方案为 null 且 prune 了的记 null（删掉了，或者值被改过、已经不是 agentree 的）；没 prune 的保留上次的记录。
+ * written 缺省当作全部写了（只在测试里这么用）
  */
-export function nextWrote(preset: Preset, applied: AppliedRecord | null, pruning: boolean): AppliedRecord['wrote'] {
+export function nextWrote(preset: Preset, applied: AppliedRecord | null, pruning: boolean, written: WrittenKeys = ALL_WRITTEN): AppliedRecord['wrote'] {
   const prev = applied?.wrote ?? { model: null, advisorModel: null, effort: null, autoCompactWindow: null };
+  const keep = <T>(specified: T | null, wroteNow: boolean, prevValue: T | null, same: (a: T, b: T) => boolean): T | null => {
+    if (specified === null) return pruning ? null : prevValue;
+    if (wroteNow) return specified;
+    return prevValue !== null && same(prevValue, specified) ? prevValue : null;
+  };
+  const eq = <T>(a: T, b: T) => a === b;
+  const effort: WrittenEffort | null = preset.main.effort !== null ? { ...mainEffortLocation(preset.main.model), value: preset.main.effort } : null;
   return {
-    model: preset.main.model !== null ? preset.main.model : pruning ? null : prev.model,
-    advisorModel: preset.advisor.model !== null ? preset.advisor.model : pruning ? null : prev.advisorModel,
-    effort: preset.main.effort !== null ? { ...mainEffortLocation(preset.main.model), value: preset.main.effort } : pruning ? null : prev.effort,
-    autoCompactWindow: preset.main.autoCompactWindow !== null ? preset.main.autoCompactWindow : pruning ? null : prev.autoCompactWindow,
+    model: keep(preset.main.model, written.model, prev.model, eq),
+    advisorModel: keep(preset.advisor.model, written.advisorModel, prev.advisorModel, eq),
+    effort: keep(effort, written.effort, prev.effort, sameEffort),
+    autoCompactWindow: keep(preset.main.autoCompactWindow, written.autoCompactWindow, prev.autoCompactWindow, eq),
   };
 }
 
@@ -346,6 +366,8 @@ export class Planner {
   /** baseHash 对不上（文件在用户打开之后被改过或删掉）的文件路径 */
   private conflicts: string[] = [];
   private touched = { mainModel: false, advisorModel: false, effort: false, compact: false, agentModel: false, agentEffort: false, agents: false, newAgentDir: false };
+  /** 这次实际写入（值有改动或新建）的 settings 键，applied.json 的 wrote 只记这些 */
+  private written: WrittenKeys = { model: false, advisorModel: false, effort: false, autoCompactWindow: false };
   private presetApplied: PresetApplyInfo | undefined;
 
   constructor(private ctx: PlanContext) {}
@@ -395,8 +417,8 @@ export class Planner {
     return checkWritable(p, this.ctx.knownCwds);
   }
 
-  /** 对 settings.json 做一次修改。文件不存在时从 {} 开始，最后只含要写的键 */
-  private editSettings(summary: string, fn: (text: string) => string) {
+  /** 对 settings.json 做一次修改。文件不存在时从 {} 开始，最后只含要写的键。返回内容是否有改动 */
+  private editSettings(summary: string, fn: (text: string) => string): boolean {
     const f = this.file(this.settingsTarget());
     const current = f.text ?? '{}';
     let next: string;
@@ -406,14 +428,15 @@ export class Planner {
       if (e instanceof JsonEditError) throw new PlanError(e.message);
       throw e;
     }
-    if (next !== current) {
-      f.text = next;
-      f.summaries.push(summary);
-    }
+    if (next === current) return false;
+    f.text = next;
+    f.summaries.push(summary);
+    return true;
   }
 
-  private setSetting(pathKeys: string[], value: string | number | null, summary: string) {
-    this.editSettings(summary, (text) => {
+  /** 返回是否真的改了值（文件里本来就是这个值时为 false） */
+  private setSetting(pathKeys: string[], value: string | number | null, summary: string): boolean {
+    return this.editSettings(summary, (text) => {
       const doc = parseJsonDoc(text);
       if (value === null) return removeValue(doc, pathKeys, 'settings.json', pathKeys.length > 2);
       const existing = nodeAt(doc, pathKeys);
@@ -494,13 +517,13 @@ export class Planner {
 
   mainModel(value: unknown) {
     const v = this.optString(value, '主模型');
-    this.setSetting(['model'], v, v === null ? '删除 model' : `把 model 设为 ${v}`);
+    if (this.setSetting(['model'], v, v === null ? '删除 model' : `把 model 设为 ${v}`) && v !== null) this.written.model = true;
     this.touched.mainModel = true;
   }
 
   advisorModel(value: unknown) {
     const v = this.optString(value, 'advisor 模型');
-    this.setSetting(['advisorModel'], v, v === null ? '删除 advisorModel（关闭 advisor）' : `把 advisorModel 设为 ${v}`);
+    if (this.setSetting(['advisorModel'], v, v === null ? '删除 advisorModel（关闭 advisor）' : `把 advisorModel 设为 ${v}`) && v !== null) this.written.advisorModel = true;
     this.touched.advisorModel = true;
   }
 
@@ -510,7 +533,9 @@ export class Planner {
       throw new PlanError(`自动压缩阈值必须是 ${AUTO_COMPACT_MIN} 到 ${AUTO_COMPACT_MAX} 之间的整数（token 数），现在是 ${String(value)}`);
     }
     const v = value === undefined ? null : value;
-    this.setSetting(['autoCompactWindow'], v, v === null ? '删除 autoCompactWindow（跟 Claude Code 默认）' : `把 autoCompactWindow 设为 ${v}（约 ${formatWindow(v)} token）`);
+    if (this.setSetting(['autoCompactWindow'], v, v === null ? '删除 autoCompactWindow（跟 Claude Code 默认）' : `把 autoCompactWindow 设为 ${v}（约 ${formatWindow(v)} token）`) && v !== null) {
+      this.written.autoCompactWindow = true;
+    }
     this.touched.compact = true;
     // 自动压缩关着的话，阈值写了也没用
     if (v !== null && this.currentSetting(['autoCompactEnabled']) === false) this.note('warn', PLAN_COMPACT_DISABLED_NOTE);
@@ -528,7 +553,7 @@ export class Planner {
     const m = this.optString(model, '模型 ID');
     this.touched.effort = true;
     if (m === null) {
-      this.setSetting(['effortLevel'], v, v === null ? '删除顶层 effortLevel' : `把顶层 effortLevel 设为 ${v}`);
+      if (this.setSetting(['effortLevel'], v, v === null ? '删除顶层 effortLevel' : `把顶层 effortLevel 设为 ${v}`) && v !== null) this.written.effort = true;
       if (v !== null) {
         this.note('warn', '顶层 effortLevel 在用户级 settings.json 里只对 Opus 5、Fable 5.1 及更早的模型生效；Opus 5.5 及之后的模型会忽略它，需要按模型写在 modelSettings 里');
       }
@@ -541,7 +566,9 @@ export class Planner {
     if (key !== m.toLowerCase()) this.note('info', `modelSettings 的键写成规范名 ${key}（官方文档：Claude Code 按规范名保存，[1m] 和日期后缀的变体会匹配到同一项）`);
     const cur = this.currentSetting(['modelSettings']);
     if (cur !== undefined && (cur === null || typeof cur !== 'object')) throw new PlanError('settings.json 里 modelSettings 不是对象，拒绝修改');
-    this.setSetting(['modelSettings', key, 'effortLevel'], v, v === null ? `删除 modelSettings.${key}.effortLevel` : `把 modelSettings.${key}.effortLevel 设为 ${v}`);
+    if (this.setSetting(['modelSettings', key, 'effortLevel'], v, v === null ? `删除 modelSettings.${key}.effortLevel` : `把 modelSettings.${key}.effortLevel 设为 ${v}`) && v !== null) {
+      this.written.effort = true;
+    }
   }
 
   rule(enabled: unknown, text: unknown) {
@@ -670,14 +697,8 @@ export class Planner {
     set('model', fields.model);
     set('effort', fields.effort);
     set('tools', fields.tools);
-    if (body !== null) {
-      const b = body.replace(/\r?\n/g, doc.eol);
-      if (b !== doc.body) {
-        doc.body = b;
-        if (!doc.closeEol) doc.closeEol = true;
-        changed.push('修改正文');
-      }
-    }
+    // 正文按提示词比较：frontmatter 后面的分隔空行不算正文，读出来是什么、原样提交就不算改动
+    if (body !== null && setPrompt(doc, body)) changed.push('修改正文');
     return changed;
   }
 
@@ -805,7 +826,7 @@ export class Planner {
       }
     }
     if (removed.length) this.note('info', `这次会移除：${removed.join('、')}`);
-    this.presetApplied = { preset, projectCwd: cwd, includeRule: includeRule === true, wrote: nextWrote(preset, applied, pruning) };
+    this.presetApplied = { preset, projectCwd: cwd, includeRule: includeRule === true, wrote: nextWrote(preset, applied, pruning, this.written) };
   }
 
   /** 预设里的 agent 还没有定义文件：按预设内容新建，缺的项用模板补 */

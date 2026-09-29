@@ -457,7 +457,7 @@ export interface AgentFields {
 }
 
 export interface AgentDefinitionDetail extends AgentDefinition {
-  /** frontmatter 之后的正文，即系统提示词 */
+  /** frontmatter 之后的正文，即系统提示词。frontmatter 和正文之间那个分隔用的空行不算在内，所以读出来的正文和写入时提交的一致 */
   body: string;
   /** frontmatter 里 agentree 不管理的其他字段名，仅用于展示 */
   otherFields: string[];

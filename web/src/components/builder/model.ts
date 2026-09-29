@@ -72,7 +72,7 @@ export const KIND_COLOR: Record<Kind, string> = {
 };
 export const BUILTIN = ['general-purpose', 'Explore', 'Plan', 'claude-code-guide', 'statusline-setup', 'claude', 'output-style-setup'];
 const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
-const WIN_RESERVED = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])$/i;
+const WIN_RESERVED = /^(con|prn|aux|nul|conin\$|conout\$|com[0-9]|lpt[0-9])$/i;
 const STORE_KEY = 'agentree.builder.v2';
 const OLD_STORE_KEY = 'agentree.builder.v1';
 /** 每个范围各存各的：全局方案一份，每个项目方案一份 */
