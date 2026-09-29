@@ -240,7 +240,7 @@ export default function Inspector(p: Props) {
             <h3>自动压缩阈值</h3>
             <div className="field-grid">
               <label htmlFor="bi-compact">阈值</label>
-              <CompactSelect id="bi-compact" value={n.autoCompactWindow} onChange={(v) => p.onPatch({ autoCompactWindow: v })} />
+              <CompactSelect id="bi-compact" value={n.autoCompactWindow} onChange={(v) => p.onPatch({ autoCompactWindow: v })} emptyLabel="不指定" />
             </div>
             {issueOf('compact') && <div className="field-err">{issueOf('compact')!.text}</div>}
             <div className="field-hint" style={{ marginTop: 10 }}>

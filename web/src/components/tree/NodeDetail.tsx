@@ -202,8 +202,11 @@ export default function NodeDetail({ node, index, sessionChecks, onSelect, onClo
                   <div className="small muted">
                     自动压缩前的上下文：
                     {node.compactions.autoPreTokens.map((n, i) => (
-                      <span key={i} className="num" title={`${fullNumber(n)} token`} style={{ marginLeft: i ? 6 : 4 }}>
-                        {shortNumber(n)}
+                      <span key={i}>
+                        {i > 0 && '、'}
+                        <span className="num" title={`${fullNumber(n)} token`}>
+                          {shortNumber(n)}
+                        </span>
                       </span>
                     ))}
                     <span className="dim"> token</span>
