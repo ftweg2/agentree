@@ -1,0 +1,20 @@
+{
+  "name": "agentree",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Claude Code agent 树可视化、用量统计与配置一致性检查",
+  "scripts": {
+    "setup": "node scripts/run.mjs setup",
+    "dev": "node scripts/run.mjs dev",
+    "build": "node scripts/run.mjs build",
+    "start": "node scripts/run.mjs start",
+    "test": "npm --prefix server test",
+    "desktop:dev": "npm --prefix desktop run dev",
+    "desktop:build": "npm --prefix desktop run build"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ftweg2/agentree.git"
+  }
+}

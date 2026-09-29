@@ -1,0 +1,763 @@
+/*
+ * 搭建页：节点上的摘要行、状态标记、右侧的编辑面板、生效检查
+ * 画布和节点的基础样式在 canvas.css
+ */
+
+/* ───────── 页头的三个步骤 ───────── */
+.steps {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  color: var(--text-3);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+.steps > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 4px;
+  transition: color var(--t2);
+}
+.steps > span + span::before {
+  content: '';
+  width: 22px;
+  height: 1px;
+  margin-right: 6px;
+  background: var(--line-strong);
+}
+.steps i {
+  display: inline-grid;
+  place-items: center;
+  flex: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  border: 1px solid var(--line-strong);
+  font-family: var(--mono);
+  font-size: 11px;
+  font-style: normal;
+  transition:
+    background-color var(--t2),
+    border-color var(--t2),
+    color var(--t2);
+}
+.steps .now {
+  color: var(--text);
+}
+.steps .now i {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+.steps .done {
+  color: var(--text-2);
+}
+.steps .done i {
+  border-color: transparent;
+  background: var(--ok-bg);
+  color: var(--ok);
+}
+
+/* ───────── 状态 ───────── */
+.state-chip {
+  flex: none;
+  padding: 0 7px;
+  height: 19px;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.26);
+  color: var(--text-2);
+  font-size: 11.5px;
+  line-height: 19px;
+  white-space: nowrap;
+}
+:root[data-theme='light'] .state-chip {
+  background: rgba(255, 255, 255, 0.7);
+}
+.state-chip.pending {
+  color: var(--warn);
+}
+.state-chip.invalid,
+.state-chip.off {
+  color: var(--fail);
+}
+.state-chip.written,
+.state-chip.loaded,
+.state-chip.manual {
+  color: var(--info);
+}
+.state-chip.live {
+  color: var(--ok);
+}
+.state-chip.live::before {
+  content: '✓ ';
+}
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  height: 28px;
+  padding: 0 11px 0 10px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+  font-size: 12.5px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background-color var(--t1),
+    color var(--t1);
+}
+.status-pill:hover,
+.status-pill.on {
+  background: var(--hover);
+  color: var(--text);
+}
+.status-pill i {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-3);
+}
+.status-pill.todo i {
+  background: var(--warn);
+  box-shadow: 0 0 8px var(--warn);
+}
+.status-pill.bad i {
+  background: var(--fail);
+  box-shadow: 0 0 8px var(--fail);
+}
+.status-pill.ok i {
+  background: var(--ok);
+}
+.status-pill.todo {
+  color: var(--warn);
+}
+.status-pill.bad {
+  color: var(--fail);
+}
+
+/* ───────── 节点上的摘要行 ───────── */
+.bnode-rows {
+  padding: 4px 6px 8px;
+  border-top: 1px solid var(--line);
+  cursor: default;
+}
+.bnode-row {
+  display: grid;
+  grid-template-columns: 68px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  width: 100%;
+  padding: 6px 6px;
+  border: none;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1.5;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--t1);
+}
+.bnode-row:hover,
+.bnode-row:focus-visible {
+  outline: none;
+  background: var(--hover);
+}
+.bnode-row .k {
+  color: var(--text-3);
+  font-size: 12px;
+}
+.bnode-row .v {
+  min-width: 0;
+  color: var(--text-2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bnode-row .v.clamp {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  line-clamp: 2;
+  white-space: normal;
+}
+.bnode-row.bad .v {
+  color: var(--fail);
+}
+.bnode-row.warn .v {
+  color: var(--warn);
+}
+.bnode.loose .bnode-rows {
+  opacity: 0.72;
+}
+.bnode-note {
+  display: block;
+  width: 100%;
+  padding: 0 12px 12px;
+  border: none;
+  background: transparent;
+  color: var(--text-3);
+  font: inherit;
+  font-size: 11.5px;
+  line-height: 1.55;
+  text-align: left;
+  cursor: default;
+}
+.bnode-note.as-btn {
+  cursor: pointer;
+}
+.bnode-note.as-btn:hover {
+  color: var(--text-2);
+}
+.bnode-rows + .bnode-note {
+  padding-top: 2px;
+}
+
+/* ───────── 空画布上的引导 ───────── */
+.starter {
+  position: absolute;
+  z-index: 4;
+  left: 50%;
+  bottom: 84px;
+  width: min(880px, calc(100% - 72px));
+  padding: 20px 22px 22px;
+  border-radius: 16px;
+  border: 1px solid var(--line-strong);
+  background: var(--glass);
+  -webkit-backdrop-filter: blur(18px);
+  backdrop-filter: blur(18px);
+  box-shadow: var(--shadow-3);
+  cursor: default;
+  transform: translateX(-50%);
+  animation: starter-in var(--t4) var(--ease) 120ms both;
+}
+@keyframes starter-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, 14px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+.starter h2 {
+  font-size: 16px;
+}
+.starter p {
+  margin: 4px 0 14px;
+  color: var(--text-2);
+  font-size: 13px;
+}
+.starter-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 10px;
+}
+.starter-card {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  padding: 14px 16px 15px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--surface-2);
+  color: var(--text-2);
+  font: inherit;
+  font-size: 12.5px;
+  line-height: 1.55;
+  text-align: left;
+  cursor: pointer;
+  transition:
+    border-color var(--t1),
+    background-color var(--t1),
+    transform var(--t2) var(--ease);
+}
+.starter-card:hover,
+.starter-card:focus-visible {
+  outline: none;
+  border-color: var(--text-3);
+  background: var(--surface-3);
+  transform: translateY(-2px);
+}
+.starter-card b {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+}
+.starter-card .tag {
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+.starter-card.rec {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent);
+}
+.starter-card.rec .tag {
+  color: var(--accent);
+}
+
+/* ───────── 右侧的编辑面板 ───────── */
+.inspector.builder-insp {
+  width: 432px;
+}
+.sd-body.builder.has-insp .canvas-tools.tr,
+.sd-body.builder.has-insp .canvas-tools.br {
+  right: 468px;
+}
+.sd-body.builder.has-insp .toast {
+  left: calc(50% - 225px);
+}
+.builder-insp .insp-head h2 {
+  font-size: 16px;
+}
+.builder-insp .kind-dot {
+  flex: none;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--nc);
+}
+.builder-insp .state-chip {
+  background: var(--muted-bg);
+}
+.builder-insp .field-hint {
+  margin-top: 8px;
+  color: var(--text-3);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.builder-insp .field-hint a {
+  color: var(--link);
+}
+.builder-insp .field-err {
+  margin-top: 6px;
+  font-size: 12px;
+}
+.builder-insp .field-err.warn {
+  color: var(--warn);
+}
+.builder-insp .textarea.invalid {
+  border-color: var(--fail);
+}
+.builder-insp .prompt-area {
+  min-height: 220px;
+  line-height: 1.6;
+}
+.field-grid {
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr);
+  align-items: center;
+  gap: 10px 12px;
+}
+.field-grid > label {
+  color: var(--text-3);
+  font-size: 12.5px;
+}
+.field-grid .select,
+.field-grid .input {
+  width: 100%;
+}
+.field-grid .model-input {
+  flex-direction: column;
+  gap: 6px;
+}
+.field-grid .model-input .select,
+.field-grid .model-input .input {
+  flex: none;
+  width: 100%;
+  min-width: 0;
+}
+
+/* 工具 */
+.tool-presets {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 4px;
+  padding: 3px;
+  border-radius: 9px;
+  background: var(--muted-bg);
+}
+.tool-presets button {
+  height: 28px;
+  padding: 0 4px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-2);
+  font: inherit;
+  font-size: 12.5px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition:
+    background-color var(--t2),
+    color var(--t2);
+}
+.tool-presets button:hover {
+  color: var(--text);
+}
+.tool-presets button.on {
+  background: var(--surface-3);
+  color: var(--text);
+  box-shadow: var(--shadow-1);
+}
+.tool-presets button:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--focus) 50%, transparent);
+}
+.tool-grid {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+  padding: 12px;
+  border-radius: var(--r);
+  background: var(--surface-2);
+  animation: rise-in var(--t3) var(--ease) both;
+}
+.tool-group {
+  display: grid;
+  grid-template-columns: 34px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+}
+.tool-group-label {
+  padding-top: 5px;
+  color: var(--text-3);
+  font-size: 12px;
+}
+.tool-items {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.tool-item {
+  display: inline-flex;
+  align-items: center;
+  height: 26px;
+  padding: 0 10px;
+  border-radius: 13px;
+  border: 1px solid var(--line-strong);
+  color: var(--text-2);
+  font-size: 12px;
+  cursor: pointer;
+  user-select: none;
+  transition:
+    background-color var(--t1),
+    border-color var(--t1),
+    color var(--t1);
+}
+.tool-item:hover {
+  border-color: var(--text-3);
+  color: var(--text);
+}
+.tool-item input {
+  position: absolute;
+  opacity: 0;
+  pointer-events: none;
+}
+.tool-item.on {
+  border-color: transparent;
+  background: color-mix(in srgb, var(--accent) 18%, transparent);
+  color: var(--text);
+}
+.tool-item:has(input:focus-visible) {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--focus) 50%, transparent);
+}
+
+/* 主会话的模型怎么决定 */
+.howto {
+  display: grid;
+  gap: 8px;
+  margin-top: 14px;
+  padding: 12px 14px;
+  border-radius: var(--r);
+  background: var(--surface-2);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.howto-row {
+  display: grid;
+  grid-template-columns: 44px minmax(0, 1fr);
+  gap: 10px;
+  color: var(--text-2);
+}
+.howto-row b {
+  color: var(--text-3);
+  font-weight: 500;
+}
+.howto-row em {
+  display: block;
+  color: var(--warn);
+  font-style: normal;
+}
+.howto.desktop .howto-row:first-child {
+  color: var(--text);
+}
+
+/* ───────── 生效检查 ───────── */
+.effect-list {
+  display: grid;
+  gap: 10px;
+}
+.effect-item {
+  padding: 12px 14px;
+  border-radius: var(--r);
+  background: var(--surface-2);
+  font-size: 12.5px;
+}
+.effect-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 10px;
+  min-width: 0;
+}
+.effect-title b {
+  font-size: 13px;
+  font-weight: 600;
+}
+.effect-title .mono {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+}
+.effect-steps {
+  position: relative;
+  display: grid;
+  gap: 10px;
+}
+/* 把几步用一根竖线串起来 */
+.effect-steps::before {
+  content: '';
+  position: absolute;
+  left: 5px;
+  top: 10px;
+  bottom: 14px;
+  width: 1px;
+  background: var(--line-strong);
+}
+.effect-step {
+  position: relative;
+  display: grid;
+  grid-template-columns: 11px minmax(0, 1fr);
+  gap: 11px;
+  align-items: start;
+}
+.effect-step > i {
+  width: 11px;
+  height: 11px;
+  margin-top: 4px;
+  border-radius: 50%;
+  border: 2px solid var(--text-3);
+  background: var(--surface-2);
+}
+.effect-step.ok > i {
+  border-color: var(--ok);
+  background: var(--ok);
+}
+.effect-step.todo > i {
+  border-color: var(--warn);
+}
+.effect-step.bad > i {
+  border-color: var(--fail);
+  background: var(--fail);
+}
+.effect-step.na > i {
+  border-style: dashed;
+}
+.effect-step .k {
+  color: var(--text-3);
+  font-size: 11.5px;
+}
+.effect-step .v {
+  color: var(--text);
+}
+.effect-step.wait .v,
+.effect-step.na .v {
+  color: var(--text-2);
+}
+.effect-step.todo .v {
+  color: var(--warn);
+}
+.effect-step.bad .v {
+  color: var(--fail);
+}
+.effect-step .d {
+  margin-top: 1px;
+  color: var(--text-3);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.effect-summary {
+  margin-top: 11px;
+  padding-top: 10px;
+  border-top: 1px solid var(--line);
+  color: var(--text-2);
+  line-height: 1.6;
+}
+.effect-next {
+  margin-top: 6px;
+  color: var(--text);
+  line-height: 1.6;
+}
+.effect-flow {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+.effect-flow > div {
+  padding: 12px 12px 11px;
+  border-radius: var(--r);
+  background: var(--surface-2);
+}
+.effect-flow b {
+  display: block;
+  font-family: var(--mono);
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+.effect-flow span {
+  color: var(--text-3);
+  font-size: 12px;
+}
+.effect-flow .todo b {
+  color: var(--warn);
+}
+.effect-flow .bad b {
+  color: var(--fail);
+}
+.effect-flow .ok b {
+  color: var(--ok);
+}
+.effect-flow .wait b {
+  color: var(--info);
+}
+
+/* ───────── 写入之后的"接下来" ───────── */
+.next-box {
+  padding: 16px 18px;
+  border-radius: var(--r);
+  border: 1px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  background: var(--ok-bg);
+}
+.next-box h3 {
+  margin-bottom: 8px;
+  font-size: 13.5px;
+}
+.next-steps {
+  margin: 0;
+  padding-left: 20px;
+  color: var(--text-2);
+  font-size: 13px;
+  line-height: 1.75;
+}
+.next-steps b {
+  color: var(--text);
+  font-weight: 600;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .starter,
+  .tool-grid {
+    animation: none;
+  }
+}
+
+/* ───────── 方案的范围 ───────── */
+.scope-bar {
+  display: flex;
+  align-items: center;
+  flex: none;
+  min-width: 0;
+}
+.scope-bar .select {
+  max-width: 260px;
+  height: 30px;
+  font-size: 13px;
+  font-weight: 550;
+  background: var(--surface-2);
+}
+
+/* 项目方案画布上的"全局方案"节点：只读，列出从全局继承来的内容 */
+.bnode.global {
+  border-style: dashed;
+  background: color-mix(in srgb, var(--node-bg) 86%, transparent);
+}
+.bnode.global .bnode-head {
+  background: var(--node-head);
+}
+.head-link {
+  flex: none;
+  height: 22px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--link);
+  font: inherit;
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color var(--t1);
+}
+.head-link:hover,
+.head-link:focus-visible {
+  outline: none;
+  background: var(--hover);
+}
+.gl-list {
+  padding: 2px 6px 8px;
+  cursor: default;
+}
+.gl-row {
+  display: grid;
+  grid-template-columns: minmax(0, auto) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  min-height: 30px;
+  padding: 0 0 0 6px;
+  border-radius: 7px;
+  font-size: 12.5px;
+}
+.gl-row .k {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+.gl-row .k:not(.mono) {
+  color: var(--text-3);
+  font-size: 12px;
+}
+.gl-row .v {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-3);
+  font-size: 12px;
+}
+.gl-row.over .k {
+  color: var(--text-3);
+  text-decoration: line-through;
+}
+.gl-empty {
+  padding: 6px;
+  color: var(--text-3);
+  font-size: 12px;
+}
+.canvas-lines path.link.inherited {
+  stroke: var(--text-3);
+  stroke-width: 2;
+  stroke-dasharray: 5 6;
+  pointer-events: none;
+  opacity: 0.7;
+}

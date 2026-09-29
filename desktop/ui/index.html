@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>agentree</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="card" id="card" data-phase="starting">
+    <header class="brand">
+      <svg class="logo" viewBox="0 0 64 64" aria-hidden="true">
+        <rect x="2" y="2" width="60" height="60" rx="14" class="logo-bg"/>
+        <g class="logo-fg" fill="none" stroke-width="4" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M32 18 V28 M18 28 H46 M18 28 V40 M46 28 V40 M40 44 H52 M40 44 V48 M52 44 V48"/>
+        </g>
+        <g class="logo-fg-fill">
+          <circle cx="32" cy="16" r="5.5"/>
+          <circle cx="18" cy="43" r="5"/>
+          <circle cx="46" cy="41" r="4.5"/>
+          <circle cx="40" cy="50" r="3.6"/>
+          <circle cx="52" cy="50" r="3.6"/>
+        </g>
+      </svg>
+      <div>
+        <h1>agentree</h1>
+        <p class="sub">Claude Code agent 树与用量统计</p>
+      </div>
+    </header>
+
+    <section class="state">
+      <div class="spinner" aria-hidden="true"></div>
+      <div class="state-text">
+        <h2 id="title">正在启动</h2>
+        <p id="message">正在准备…</p>
+      </div>
+    </section>
+
+    <div class="progress" id="progress"><div class="bar" id="bar"></div></div>
+
+    <p class="hint" id="hint" hidden></p>
+
+    <dl class="meta" id="meta"></dl>
+
+    <details class="logs" id="logs-box" hidden>
+      <summary id="logs-summary">后端输出</summary>
+      <pre id="logs"></pre>
+    </details>
+
+    <div class="actions" id="actions" hidden>
+      <button type="button" id="retry">重试</button>
+    </div>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

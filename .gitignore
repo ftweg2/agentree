@@ -1,0 +1,27 @@
+# 依赖和构建产物
+node_modules/
+dist/
+target/
+desktop/src-tauri/gen/
+
+# 本机数据：索引、方案、备份都在用户目录下的 .agentree，不在项目里。这里是保险
+*.db
+*.db-shm
+*.db-wal
+.agentree/
+
+# 环境和密钥
+.env
+.env.*
+!.env.mock
+!.env.example
+
+# 编辑器和系统文件
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+
+# Claude Code 的本地设置（个人用，不进版本库）
+.claude/settings.local.json

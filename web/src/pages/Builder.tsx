@@ -1,0 +1,1566 @@
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Link } from 'react-router-dom';
+import type { AgentTemplateInfo, ClaudeConfigSnapshot, ClaudeMdRuleState, EffectReport, Preset, PresetAgent, PresetTemplate, SchemeInfo } from '../types';
+import { api, ApiFailure } from '../api/client';
+import { useApi } from '../lib/useApi';
+import { modelColor, shortModel } from '../lib/models';
+import { useTheme } from '../lib/theme';
+import { ErrorBox, Skeleton } from '../components/ui';
+import { EffortSelect, ModelInput } from '../components/inputs';
+import PlanDialog from '../components/plan/PlanDialog';
+import Modal from '../components/Modal';
+import { Positioned } from '../components/tree/TreeCanvas';
+import { noodle, useCanvasView, useNodeDrag, type Pt } from '../components/canvas/useCanvasView';
+import Inspector, { EffectPanel, type Section } from '../components/builder/Inspector';
+import {
+  arrange,
+  blankNode,
+  BW,
+  canSpawn,
+  comparable,
+  GLOBAL_W,
+  globalHeight,
+  globalHome,
+  graphFromPreset,
+  isBuiltin,
+  KIND_COLOR,
+  KIND_LABEL,
+  clearStored,
+  loadStored,
+  NODE_H,
+  nodeState,
+  pendingCount,
+  portY,
+  presetFromGraph,
+  promptSummary,
+  saveStored,
+  STATE_LABEL,
+  toolSummary,
+  validate,
+  writableCount,
+  type BNode,
+  type Graph,
+  type Kind,
+  type NodeIssue,
+} from '../components/builder/model';
+
+/**
+ * 搭建页：用节点和连线搭出自己的 agent 方案，写入 Claude Code，再看它有没有生效。
+ *
+ * 一个方案走三步：
+ *   搭   在画布上摆节点、连线，在右侧面板里写清楚每个 agent 什么时候用、能用什么工具、怎么干活
+ *   写   点"应用"，看过差异后写入 Claude Code 的配置文件
+ *   验   新开会话正常使用，节点上的状态会从"已写入"变成"已加载""已生效"
+ *
+ * 方案分两种范围：
+ *   全局方案  对所有项目生效
+ *   项目方案  只对某个项目目录下的会话生效。项目里实际能用的是两者叠加：全局的子 agent 在项目里同样可用，
+ *             同名时用项目的。所以项目方案的画布上有一个"全局方案"节点，列出从全局继承来的内容
+ */
+
+interface MenuState {
+  /** 菜单在画布容器里的位置 */
+  at: Pt;
+  /** 新节点放在画布上的位置 */
+  place: Pt;
+  mode: 'add' | 'plan';
+}
+interface Draft {
+  from: string;
+  start: Pt;
+  cursor: Pt;
+  color: string;
+}
+type Selected = { t: 'node' | 'link'; id: string } | null;
+
+/** 右侧面板占掉的宽度（面板宽度加上它到窗口边缘的距离），和 builder.css 里的数值对应 */
+const SIDE_W = 450;
+
+const SCOPE_KEY = 'agentree.builder.scope';
+const samePath = (a: string | null | undefined, b: string | null | undefined) => !!a && !!b && a.replace(/\\/g, '/').toLowerCase() === b.replace(/\\/g, '/').toLowerCase();
+/** 项目目录太长，界面上只显示最后两级 */
+const shortPath = (p: string) => p.replace(/\\/g, '/').split('/').filter(Boolean).slice(-2).join('/');
+
+const errText = (e: unknown) => (e instanceof ApiFailure ? e.message : e instanceof Error ? e.message : String(e));
+
+interface CanvasProps {
+  /** 项目方案时是项目目录；全局方案为 null */
+  projectCwd: string | null;
+  /** 页头里切换范围的控件 */
+  scopeBar: React.ReactNode;
+  /** 方案保存、应用或删除之后调用，让范围列表刷新 */
+  onSchemesChanged: () => void;
+  onGoGlobal: () => void;
+}
+
+function BuilderCanvas({ projectCwd, scopeBar, onSchemesChanged, onGoGlobal }: CanvasProps) {
+  const presetQ = useApi<Preset>(`preset:${projectCwd ?? ''}`, () => api.preset(projectCwd));
+  const configQ = useApi<ClaudeConfigSnapshot>('config', api.config);
+  const templatesQ = useApi<PresetTemplate[]>('templates', api.templates);
+  const agentTplQ = useApi<AgentTemplateInfo[]>('agent-templates', api.agentTemplates);
+  const ruleQ = useApi<ClaudeMdRuleState>(`rule:${projectCwd ?? ''}`, () => api.rule(projectCwd));
+  const { theme } = useTheme();
+  const cv = useCanvasView();
+
+  const [saved, setSaved] = useState<Preset | null>(null);
+  const [graph, setGraph] = useState<Graph | null>(null);
+  /** 磁盘上现有的定义，用来补全预设里没记录的内容；读取失败时为空数组 */
+  const [disk, setDisk] = useState<PresetAgent[] | null>(null);
+  const [selected, setSelected] = useState<Selected>(null);
+  const [focus, setFocus] = useState<Section | null>(null);
+  const [panel, setPanel] = useState(false);
+  const [menu, setMenu] = useState<MenuState | null>(null);
+  const [draft, setDraft] = useState<Draft | null>(null);
+  const [toast, setToast] = useState<{
+    kind: 'ok' | 'error' | 'info';
+    text: string;
+  } | null>(null);
+  const [busy, setBusy] = useState<'save' | 'gen' | null>(null);
+  const [applying, setApplying] = useState<{
+    preset: Preset;
+    rule: boolean;
+    ruleText: string | null;
+  } | null>(null);
+  const [report, setReport] = useState<EffectReport | null>(null);
+  const [tick, setTick] = useState(0);
+
+  // 项目方案的画布上要显示从全局继承来的内容：全局方案里的，加上全局配置里已经有定义文件的
+  const [globalScheme, setGlobalScheme] = useState<Preset | null>(null);
+  useEffect(() => {
+    if (!projectCwd) return;
+    let dead = false;
+    void Promise.all([api.preset().catch(() => null), api.presetFromConfig().catch(() => null)]).then(([scheme, onDisk]) => {
+      if (dead) return;
+      const files = new Map((onDisk?.agents ?? []).map((a) => [a.name, a]));
+      const agents: PresetAgent[] = [];
+      for (const a of scheme?.agents ?? []) {
+        const d = files.get(a.name);
+        files.delete(a.name);
+        agents.push({
+          ...a,
+          description: a.description ?? a.note ?? d?.description,
+          tools: a.tools !== undefined ? a.tools : d?.tools,
+          disallowedTools: a.disallowedTools !== undefined ? a.disallowedTools : d?.disallowedTools,
+          prompt: a.prompt ?? d?.prompt,
+        });
+      }
+      for (const d of files.values()) agents.push(d);
+      setGlobalScheme({
+        version: 1,
+        main: scheme?.main ?? { model: null, effort: null },
+        advisor: scheme?.advisor ?? { model: null },
+        agents,
+        allowBuiltins: scheme?.allowBuiltins ?? true,
+        updatedAt: scheme?.updatedAt ?? null,
+      });
+    });
+    return () => {
+      dead = true;
+    };
+  }, [projectCwd]);
+
+  const readDisk = useCallback(async () => {
+    try {
+      const p = await api.presetFromConfig(projectCwd);
+      setDisk(p.agents ?? []);
+      return p;
+    } catch {
+      setDisk([]);
+      return null;
+    }
+  }, [projectCwd]);
+  useEffect(() => {
+    void readDisk();
+  }, [readDisk]);
+
+  // 预设、磁盘上的定义、规则状态都拿到后建图；之后不再用服务器数据覆盖用户的编辑
+  const ruleReady = !!ruleQ.data || !!ruleQ.error;
+  useEffect(() => {
+    if (graph || !presetQ.data || disk === null || !ruleReady) return;
+    const stored = loadStored(projectCwd);
+    setSaved(presetQ.data);
+    // 上次留在画布上的图优先：没应用、没保存的修改刷新后还在
+    const g = stored.draft ?? graphFromPreset(presetQ.data, { ...stored, rule: stored.rule || !!ruleQ.data?.enabled }, disk);
+    setGraph(projectCwd && !g.globalPos ? { ...g, globalPos: globalHome(g.nodes, new Set(g.linked)) } : g);
+  }, [presetQ.data, disk, ruleReady, ruleQ.data, graph, projectCwd]);
+
+  useEffect(() => {
+    if (!toast) return;
+    const id = window.setTimeout(() => setToast(null), toast.kind === 'error' ? 6000 : 3600);
+    return () => window.clearTimeout(id);
+  }, [toast]);
+
+  const linked = useMemo(() => new Set(graph?.linked ?? []), [graph]);
+  const current = useMemo(() => (graph ? presetFromGraph(graph, saved?.updatedAt ?? null) : null), [graph, saved]);
+  const dirty = !!(current && saved && comparable(current) !== comparable(saved));
+  const ruleLinked = !!graph?.nodes.some((n) => n.kind === 'rule' && linked.has(n.id));
+  const issues = useMemo(() => (graph ? validate(graph) : new Map<string, NodeIssue[]>()), [graph]);
+  const blocking = graph ? graph.nodes.some((n) => (n.kind === 'main' || linked.has(n.id)) && issues.get(n.id)?.some((i) => i.level === 'error')) : false;
+
+  useEffect(() => {
+    if (graph) saveStored(graph, projectCwd);
+  }, [graph, projectCwd]);
+
+  useEffect(() => {
+    if (!dirty) return;
+    const h = (e: BeforeUnloadEvent) => e.preventDefault();
+    window.addEventListener('beforeunload', h);
+    return () => window.removeEventListener('beforeunload', h);
+  }, [dirty]);
+
+  // ───────── 生效检查 ─────────
+  // 画布内容变了就重新检查（拖动节点不算）；另外每 15 秒查一次，新会话的运行结果会自己出现
+  const effectKey = useMemo(() => (graph ? JSON.stringify([presetFromGraph(graph, null, true), ruleLinked, graph.ruleText]) : null), [graph, ruleLinked]);
+  useEffect(() => {
+    const id = window.setInterval(() => setTick((t) => t + 1), 15000);
+    return () => window.clearInterval(id);
+  }, []);
+  useEffect(() => {
+    if (!effectKey) return;
+    let dead = false;
+    const id = window.setTimeout(async () => {
+      try {
+        const [preset, rule, ruleText] = JSON.parse(effectKey) as [Preset, boolean, string | null];
+        const r = await api.effect(preset, rule, ruleText, projectCwd);
+        if (!dead) setReport(r);
+      } catch {
+        // 检查失败不影响搭建，节点上只是不显示状态
+        if (!dead) setReport(null);
+      }
+    }, 450);
+    return () => {
+      dead = true;
+      window.clearTimeout(id);
+    };
+  }, [effectKey, tick, projectCwd]);
+
+  const update = useCallback((fn: (g: Graph) => Graph) => setGraph((g) => (g ? fn(g) : g)), []);
+  const patch = useCallback(
+    (id: string, p: Partial<BNode>) =>
+      update((g) => ({
+        ...g,
+        nodes: g.nodes.map((n) => (n.id === id ? { ...n, ...p } : n)),
+      })),
+    [update],
+  );
+
+  const drag = useNodeDrag({
+    getScale: () => cv.viewRef.current.k,
+    onMove: (id, pos) => (id === 'global' ? update((g) => ({ ...g, globalPos: pos })) : patch(id, pos)),
+    suppressClick: cv.suppressClick,
+  });
+
+  const sideOpen = selected?.t === 'node' || panel;
+
+  const bounds = useCallback(() => {
+    if (!graph?.nodes.length) return null;
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const n of graph.nodes) {
+      minX = Math.min(minX, n.x);
+      minY = Math.min(minY, n.y);
+      maxX = Math.max(maxX, n.x + BW);
+      maxY = Math.max(maxY, n.y + NODE_H[n.kind]);
+    }
+    if (projectCwd && graph.globalPos) {
+      const p = graph.globalPos;
+      minX = Math.min(minX, p.x);
+      minY = Math.min(minY, p.y);
+      maxX = Math.max(maxX, p.x + GLOBAL_W);
+      maxY = Math.max(maxY, p.y + globalHeight(globalScheme?.agents.length ?? 0));
+    }
+    return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+  }, [graph, projectCwd, globalScheme]);
+
+  const fit = useCallback(() => {
+    const b = bounds();
+    if (!b) return;
+    // 画布上只有主会话时，下方要给引导卡片留出位置
+    const alone = graph?.nodes.length === 1;
+    cv.fit(b, { x: 56, top: 84, bottom: alone ? 330 : 76 });
+  }, [bounds, cv, graph]);
+
+  // 第一次建好图、量出窗口大小后适应一次
+  const didFit = useRef(false);
+  useEffect(() => {
+    if (didFit.current || !graph || !cv.size) return;
+    didFit.current = true;
+    fit();
+  }, [graph, cv.size, fit]);
+  // 节点位置变了之后再适应窗口：要等新位置渲染完，用的才是新的范围
+  const [fitTick, setFitTick] = useState(0);
+  useEffect(() => {
+    if (fitTick) fit();
+    // 只在请求时执行
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fitTick]);
+  const refit = () => setFitTick((t) => t + 1);
+  // 全局方案读到之后，"全局方案"节点的高度才确定，这时再适应一次窗口
+  useEffect(() => {
+    if (globalScheme) setFitTick((t) => t + 1);
+  }, [globalScheme]);
+
+  const select = useCallback((id: string, sec: Section | null = null) => {
+    setSelected({ t: 'node', id });
+    setFocus(sec);
+    setMenu(null);
+  }, []);
+
+  // 右侧面板打开后会盖住画布的右边一条。选中的节点如果在那下面，把画布往左挪，让它露出来
+  const selectedId = selected?.t === 'node' ? selected.id : null;
+  useEffect(() => {
+    const el = cv.boxRef.current;
+    const n = selectedId ? graph?.nodes.find((x) => x.id === selectedId) : null;
+    if (!el || !n) return;
+    const v = cv.viewRef.current;
+    const left = n.x * v.k + v.x;
+    const right = left + BW * v.k;
+    const limit = el.clientWidth - SIDE_W - 28;
+    let dx = 0;
+    if (right > limit) dx = limit - right;
+    if (left + dx < 28) dx = 28 - left;
+    if (Math.abs(dx) > 1) cv.setView({ ...v, x: Math.round(v.x + dx) });
+    // 只在换了选中的节点时执行，拖动节点时不跟着挪
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedId]);
+
+  const addNode = useCallback(
+    (kind: Exclude<Kind, 'main'>, at: Pt, init?: Partial<BNode>, link = true) => {
+      const n = blankNode(kind, {
+        x: Math.round(at.x - BW / 2),
+        y: Math.round(at.y - 20),
+        model: kind === 'agent' ? 'opus' : kind === 'advisor' ? 'fable' : null,
+        effort: kind === 'agent' ? 'medium' : null,
+        ...init,
+      });
+      update((g) => {
+        if ((kind === 'advisor' || kind === 'rule') && g.nodes.some((x) => x.kind === kind)) return g;
+        return {
+          ...g,
+          nodes: [...g.nodes, n],
+          linked: link ? [...g.linked, n.id] : g.linked,
+        };
+      });
+      setMenu(null);
+      // 空白的子 agent 加上去之后直接打开编辑面板，从名字开始填
+      if (kind === 'agent' && !init?.name) select(n.id, 'basic');
+      else select(n.id);
+    },
+    [update, select],
+  );
+
+  const removeNode = useCallback(
+    (id: string) => {
+      update((g) => {
+        const n = g.nodes.find((x) => x.id === id);
+        if (!n || n.kind === 'main') return g;
+        return {
+          ...g,
+          nodes: g.nodes.filter((x) => x.id !== id),
+          linked: g.linked.filter((x) => x !== id),
+        };
+      });
+      setSelected(null);
+    },
+    [update],
+  );
+  const unlink = useCallback(
+    (id: string) => {
+      update((g) => ({ ...g, linked: g.linked.filter((x) => x !== id) }));
+      setSelected(null);
+    },
+    [update],
+  );
+  const link = useCallback((id: string) => update((g) => (g.linked.includes(id) ? g : { ...g, linked: [...g.linked, id] })), [update]);
+
+  // Delete / Backspace 删除选中的节点或连线；正在输入时不处理
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (applying) return;
+      const t = e.target as HTMLElement;
+      if (e.key === 'Escape') {
+        if (t.closest('.modal')) return;
+        (document.activeElement as HTMLElement | null)?.blur?.();
+        setMenu(null);
+        setSelected(null);
+        setPanel(false);
+        return;
+      }
+      if (t.closest('input, textarea, select, [contenteditable]')) return;
+      if ((e.key === 'Delete' || e.key === 'Backspace') && selected) {
+        e.preventDefault();
+        if (selected.t === 'link') unlink(selected.id);
+        else removeNode(selected.id);
+      }
+    };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [selected, unlink, removeNode, applying]);
+
+  /** 某个节点上连线所接的接口位置（画布坐标） */
+  const socketOf = useCallback(
+    (n: BNode, main: BNode): { from: Pt; to: Pt; color: string } => {
+      if (n.kind === 'agent') {
+        return {
+          from: { x: main.x + BW, y: main.y + portY(0) },
+          to: { x: n.x, y: n.y + portY(0) },
+          color: n.model ? modelColor(n.model, theme) : 'var(--c-agent)',
+        };
+      }
+      const row = n.kind === 'advisor' ? 0 : 1;
+      return {
+        from: { x: n.x + BW, y: n.y + portY(0) },
+        to: { x: main.x, y: main.y + portY(row) },
+        color: KIND_COLOR[n.kind],
+      };
+    },
+    [theme],
+  );
+
+  // 从接口拖出连线
+  const startLink = (e: React.PointerEvent, n: BNode) => {
+    if (e.button !== 0 || !graph) return;
+    e.stopPropagation();
+    e.preventDefault();
+    const main = graph.nodes.find((x) => x.kind === 'main')!;
+    const el = e.currentTarget as HTMLElement;
+    const r = el.getBoundingClientRect();
+    const start = cv.toCanvas(r.left + r.width / 2, r.top + r.height / 2);
+    const color = n.kind === 'main' ? (el.dataset.port === 'advisor' ? KIND_COLOR.advisor : el.dataset.port === 'rule' ? KIND_COLOR.rule : KIND_COLOR.agent) : socketOf(n, main).color;
+    const fromPort = el.dataset.port ?? '';
+    setDraft({ from: n.id, start, cursor: start, color });
+    setSelected(null);
+
+    const move = (ev: PointerEvent) => setDraft((d) => (d ? { ...d, cursor: cv.toCanvas(ev.clientX, ev.clientY) } : d));
+    const up = (ev: PointerEvent) => {
+      window.removeEventListener('pointermove', move);
+      window.removeEventListener('pointerup', up);
+      setDraft(null);
+      const target = (document.elementFromPoint(ev.clientX, ev.clientY) as HTMLElement | null)?.closest<HTMLElement>('[data-bnode]');
+      const targetId = target?.dataset.bnode;
+      if (targetId && targetId !== n.id) {
+        const other = graph.nodes.find((x) => x.id === targetId);
+        if (!other) return;
+        // 连线的两端必须有一端是主会话
+        if (n.kind === 'main' && other.kind !== 'main') {
+          const ok = fromPort === 'agent' ? other.kind === 'agent' : fromPort === other.kind;
+          if (ok) link(other.id);
+          else
+            setToast({
+              kind: 'info',
+              text: `这个接口只能连${fromPort === 'agent' ? '子 agent' : (KIND_LABEL[fromPort as Kind] ?? '')}`,
+            });
+        } else if (n.kind !== 'main' && other.kind === 'main') link(n.id);
+        else
+          setToast({
+            kind: 'info',
+            text: '连线的一端必须是主会话。子 agent 之间不能指定谁派发谁，只能在节点里打开或关闭“允许它再派发子 agent”。',
+          });
+        return;
+      }
+      // 从主会话的接口拖到空白处：在那里新建对应的节点
+      if (!target && n.kind === 'main') {
+        if (fromPort === 'agent') {
+          const box = cv.boxRef.current!.getBoundingClientRect();
+          setMenu({
+            at: { x: ev.clientX - box.left, y: ev.clientY - box.top },
+            place: cv.toCanvas(ev.clientX, ev.clientY),
+            mode: 'add',
+          });
+        } else if (fromPort === 'advisor' || fromPort === 'rule') {
+          if (!graph.nodes.some((x) => x.kind === fromPort)) addNode(fromPort, cv.toCanvas(ev.clientX, ev.clientY));
+        }
+      }
+    };
+    window.addEventListener('pointermove', move);
+    window.addEventListener('pointerup', up);
+  };
+
+  const openMenuAt = (clientX: number, clientY: number, mode: MenuState['mode'] = 'add') => {
+    const box = cv.boxRef.current!.getBoundingClientRect();
+    const at = {
+      x: Math.min(clientX - box.left, box.width - 290),
+      y: Math.min(clientY - box.top, box.height - 360),
+    };
+    setMenu({
+      at: { x: Math.max(12, at.x), y: Math.max(12, at.y) },
+      place: cv.toCanvas(clientX, clientY),
+      mode,
+    });
+  };
+  const menuUnder = (e: React.MouseEvent, mode: MenuState['mode']) => {
+    const r = e.currentTarget.getBoundingClientRect();
+    const box = cv.boxRef.current!.getBoundingClientRect();
+    setMenu(
+      menu?.mode === mode
+        ? null
+        : {
+            at: { x: r.left - box.left, y: r.bottom - box.top + 8 },
+            place: cv.toCanvas(box.left + box.width / 2, box.top + box.height / 2),
+            mode,
+          },
+    );
+  };
+
+  const save = async () => {
+    if (!current || blocking) return;
+    setMenu(null);
+    setBusy('save');
+    try {
+      const r = await api.savePreset(current, projectCwd);
+      setSaved(r);
+      onSchemesChanged();
+      setToast({
+        kind: 'ok',
+        text: '已保存为检查标准，没有修改 Claude Code 的配置。之后每个会话都会和它对比。',
+      });
+    } catch (e) {
+      setToast({ kind: 'error', text: `保存失败：${errText(e)}` });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  const replaceWith = (p: Preset, rule: boolean, note: string, fromDisk: PresetAgent[] = disk ?? []) => {
+    const g = graphFromPreset(p, { pos: {}, loose: [], rule, ruleText: graph?.ruleText ?? null }, fromDisk);
+    // 保留用户还没连上的草稿节点
+    const keep = (graph?.nodes ?? []).filter((n) => n.kind === 'agent' && !linked.has(n.id) && !g.nodes.some((x) => x.kind === 'agent' && x.name.trim() === n.name.trim()));
+    const nodes = arrange([...g.nodes, ...keep], new Set(g.linked));
+    setGraph({
+      ...g,
+      nodes,
+      ...(projectCwd ? { globalPos: globalHome(nodes, new Set(g.linked)) } : {}),
+    });
+    setSelected(null);
+    setMenu(null);
+    setToast({ kind: 'info', text: note });
+    refit();
+  };
+
+  const fromConfig = async () => {
+    setMenu(null);
+    setBusy('gen');
+    try {
+      const p = await api.presetFromConfig(projectCwd);
+      setDisk(p.agents ?? []);
+      const rule = await api.rule(projectCwd).catch(() => null);
+      replaceWith(p, !!rule?.enabled, projectCwd ? '已按这个项目现在的配置搭好。' : '已按 Claude Code 现在的配置搭好。', p.agents ?? []);
+    } catch (e) {
+      setToast({ kind: 'error', text: `读取配置失败：${errText(e)}` });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  /** 放弃画布上对某个 agent 的修改，改用配置文件里现在的内容 */
+  const pull = async (id: string, name: string) => {
+    const p = await readDisk();
+    const d = p?.agents.find((a) => a.name === name);
+    if (!d) {
+      setToast({ kind: 'error', text: `配置里没有找到 ${name} 的定义文件` });
+      return;
+    }
+    patch(id, {
+      model: d.model,
+      effort: d.effort,
+      description: d.description ?? '',
+      tools: d.tools ?? null,
+      disallowedTools: d.disallowedTools ?? null,
+      prompt: d.prompt ?? '',
+    });
+    setToast({ kind: 'info', text: `已改用配置文件里 ${name} 的内容` });
+  };
+
+  const openApply = () => {
+    if (!current || blocking) return;
+    setMenu(null);
+    setApplying({
+      preset: current,
+      rule: ruleLinked,
+      ruleText: graph?.ruleText ?? null,
+    });
+  };
+  const loadPlan = useCallback(
+    () =>
+      api.plan([
+        {
+          type: 'preset.apply',
+          projectCwd,
+          preset: applying!.preset,
+          includeRule: applying!.rule,
+          ruleText: applying!.ruleText,
+          prune: true,
+        },
+      ]),
+    [applying, projectCwd],
+  );
+
+  /** 把全局方案里的一个子 agent 复制到这个项目里，之后就可以单独改 */
+  const override = (a: PresetAgent, at?: Pt) => {
+    if (!graph) return;
+    const m = graph.nodes.find((n) => n.kind === 'main')!;
+    const count = graph.nodes.filter((n) => n.kind === 'agent').length;
+    addNode('agent', at ?? { x: m.x + BW + 120 + BW / 2, y: m.y + 20 + count * 60 }, {
+      name: a.name,
+      model: a.model,
+      effort: a.effort,
+      description: a.description ?? a.note ?? '',
+      tools: a.tools ?? null,
+      disallowedTools: a.disallowedTools ?? null,
+      prompt: a.prompt ?? '',
+    });
+  };
+
+  const removeScheme = async () => {
+    if (!projectCwd) return;
+    setMenu(null);
+    if (!window.confirm('删除这个项目的方案？\n\n只删除 agentree 里的记录和画布，这个项目之后按全局方案检查。\n已经写进项目目录的文件（定义文件、设置、规则）不会被删除。')) return;
+    try {
+      await api.deletePreset(projectCwd);
+      clearStored(projectCwd);
+      onSchemesChanged();
+      onGoGlobal();
+    } catch (e) {
+      setToast({ kind: 'error', text: `删除失败：${errText(e)}` });
+    }
+  };
+
+  const [command, setCommand] = useState<string | null>(null);
+
+  if (presetQ.error && !presetQ.data) {
+    return (
+      <div style={{ padding: 36 }}>
+        <ErrorBox error={presetQ.error} onRetry={presetQ.refresh} />
+      </div>
+    );
+  }
+
+  const main = graph?.nodes.find((n) => n.kind === 'main') ?? null;
+  const hasAdvisor = !!graph?.nodes.some((n) => n.kind === 'advisor');
+  const hasRule = !!graph?.nodes.some((n) => n.kind === 'rule');
+  const moving = cv.panning || drag.movingId !== null;
+  const existingNames = new Set(
+    (configQ.data?.definitions ?? []).filter((d) => (projectCwd ? d.source === 'project' && samePath(d.projectCwd, projectCwd) : d.source === 'user')).map((d) => d.name),
+  );
+  const globalAgents = globalScheme?.agents ?? [];
+  const overridden = new Set((graph?.nodes ?? []).filter((n) => n.kind === 'agent' && linked.has(n.id)).map((n) => n.name.trim()));
+  const agentTemplates = agentTplQ.data ?? [];
+  const selectedNode = selected?.t === 'node' ? (graph?.nodes.find((n) => n.id === selected.id) ?? null) : null;
+  const pending = pendingCount(report);
+  const writable = writableCount(report);
+  const empty = !!graph && graph.nodes.length === 1 && !main?.model && !main?.effort;
+  const diskCount = (disk ?? []).length;
+  const colorOf = (n: BNode) => ((n.kind === 'agent' || n.kind === 'main') && n.model ? modelColor(n.model, theme) : KIND_COLOR[n.kind]);
+
+  const status: { cls: string; text: string } = empty
+    ? { cls: '', text: '还没有方案' }
+    : blocking
+      ? { cls: 'bad', text: '有节点还没填完' }
+      : !report
+        ? { cls: '', text: dirty ? '有修改' : '已保存' }
+        : pending > 0
+          ? { cls: 'todo', text: `${pending} 项还没写入` }
+          : report.items.some((i) => i.observed.state === 'mismatch')
+            ? { cls: 'bad', text: '有不符合的项' }
+            : dirty
+              ? { cls: 'todo', text: '检查标准还没保存' }
+              : { cls: 'ok', text: '已写入' };
+
+  return (
+    <div className="fill">
+      <header className="sd-top" style={{ paddingBottom: 16 }}>
+        <div className="sd-title">
+          <h1>搭建</h1>
+          {scopeBar}
+          <div className="steps" aria-label="三个步骤">
+            <span className={graph && !empty ? 'done' : 'now'}>
+              <i>1</i>搭出方案
+            </span>
+            <span className={!report || empty ? '' : writable > 0 ? 'now' : 'done'}>
+              <i>2</i>写入 Claude Code
+            </span>
+            <span className={!report || empty || writable > 0 ? '' : report.items.some((i) => i.observed.state === 'match') ? 'done' : 'now'}>
+              <i>3</i>在实际运行里验证
+            </span>
+          </div>
+          <span className="spacer" />
+          <Link to="/config" className="small nowrap">
+            按文件管理 →
+          </Link>
+        </div>
+      </header>
+
+      <div className={`sd-body builder ${sideOpen ? 'has-insp' : ''}`}>
+        <div
+          ref={cv.boxRef}
+          className={`canvas ${cv.panning ? 'dragging' : ''} ${cv.wheeling ? 'wheeling' : ''} ${drag.movingId || draft ? 'node-moving' : ''}`}
+          {...cv.handlers}
+          onClick={(e) => {
+            if ((e.target as HTMLElement).closest('[data-nopan]')) return;
+            setSelected(null);
+            setMenu(null);
+          }}
+          onDoubleClick={(e) => {
+            if ((e.target as HTMLElement).closest('[data-nopan]')) return;
+            openMenuAt(e.clientX, e.clientY);
+          }}
+          onContextMenu={(e) => {
+            if ((e.target as HTMLElement).closest('[data-nopan]')) return;
+            e.preventDefault();
+            openMenuAt(e.clientX, e.clientY);
+          }}
+        >
+          {!graph || !main ? (
+            <div
+              style={{
+                position: 'absolute',
+                inset: 0,
+                display: 'grid',
+                placeItems: 'center',
+              }}
+              aria-busy="true"
+              aria-label="读取方案"
+            >
+              <div className="row" style={{ gap: 100 }}>
+                <Skeleton w={BW} h={150} style={{ borderRadius: 10 }} />
+                <Skeleton w={BW} h={230} style={{ borderRadius: 10 }} />
+                <Skeleton w={BW} h={220} style={{ borderRadius: 10 }} />
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="canvas-tools tl" data-nopan>
+                <button className="btn sm" onClick={(e) => menuUnder(e, 'add')}>
+                  ＋ 添加节点
+                </button>
+                <button className="btn sm" onClick={(e) => menuUnder(e, 'plan')} disabled={busy !== null}>
+                  {busy === 'gen' ? '读取中…' : busy === 'save' ? '保存中…' : '方案 ▾'}
+                </button>
+                <span className="sep" />
+                <button
+                  className="btn sm"
+                  onClick={() => {
+                    update((g) => {
+                      const nodes = arrange(g.nodes, new Set(g.linked));
+                      return { ...g, nodes, ...(projectCwd ? { globalPos: globalHome(nodes, new Set(g.linked)) } : {}) };
+                    });
+                    refit();
+                  }}
+                  title="自动排列所有节点"
+                >
+                  整理
+                </button>
+              </div>
+
+              <div className="canvas-tools tr" data-nopan>
+                <button
+                  className={`status-pill ${status.cls} ${panel && !selectedNode ? 'on' : ''}`}
+                  onClick={() => {
+                    setSelected(null);
+                    setPanel((v) => (selectedNode ? true : !v));
+                  }}
+                  title="查看每一项写入了没有、实际运行时用上了没有"
+                >
+                  <i />
+                  {status.text}
+                  <span className="dim">· 生效检查</span>
+                </button>
+                <button
+                  className={`btn sm ${writable > 0 || !report ? 'primary' : ''}`}
+                  disabled={blocking || !current || (!!report && writable === 0)}
+                  onClick={openApply}
+                  title={blocking ? '有节点还没填完' : report && writable === 0 ? 'Claude Code 的配置已经和画布一致' : '先显示每个文件的差异，确认后才写入'}
+                >
+                  应用到 Claude Code…
+                </button>
+              </div>
+
+              <div className="canvas-tools bl" data-nopan>
+                <button className="btn icon sm" onClick={() => cv.zoomBy(1 / 1.2)} title="缩小" aria-label="缩小">
+                  −
+                </button>
+                <button className="btn sm zoom" onClick={cv.resetZoom} title="恢复到 100%">
+                  {Math.round(cv.view.k * 100)}%
+                </button>
+                <button className="btn icon sm" onClick={() => cv.zoomBy(1.2)} title="放大" aria-label="放大">
+                  +
+                </button>
+                <span className="sep" />
+                <button className="btn sm" onClick={fit}>
+                  适应窗口
+                </button>
+              </div>
+
+              {!sideOpen && (
+                <div className="canvas-tools br" data-nopan>
+                  <div className="legend">
+                    <span className="dim">点节点编辑 · 双击空白处添加 · 从接口拖出连线 · Delete 删除</span>
+                  </div>
+                </div>
+              )}
+
+              {toast && (
+                <div className={`toast ${toast.kind}`} role="status" data-nopan>
+                  {toast.text}
+                </div>
+              )}
+
+              {empty && (
+                <div className="starter" data-nopan>
+                  <h2>{projectCwd ? '给这个项目单独搭一份方案' : '从哪里开始？'}</h2>
+                  <p>
+                    {projectCwd
+                      ? '项目方案只对这个目录下开始的会话生效。不搭也没关系：没有项目方案的项目直接用全局方案。'
+                      : '先搭出你想要的分工：主会话用什么模型，分出哪几个子 agent，各自负责什么。'}
+                  </p>
+                  <div className="starter-cards">
+                    {projectCwd && globalAgents.length > 0 && (
+                      <button
+                        className="starter-card rec"
+                        onClick={() =>
+                          replaceWith(
+                            { version: 1, main: { model: null, effort: null }, advisor: { model: null }, agents: globalAgents, allowBuiltins: globalScheme?.allowBuiltins ?? true, updatedAt: null },
+                            false,
+                            '已把全局方案的子 agent 复制到这个项目里。在这里改动不会影响全局方案。',
+                            globalAgents,
+                          )
+                        }
+                      >
+                        <span className="tag">在全局的基础上改</span>
+                        <b>复制全局方案的子 agent</b>
+                        <span>把全局方案里的 {globalAgents.length} 个子 agent 复制过来，再按这个项目的需要修改。</span>
+                      </button>
+                    )}
+                    {(templatesQ.data ?? []).slice(0, 1).map((t) => (
+                      <button key={t.id} className="starter-card rec" onClick={() => replaceWith(t.preset, t.includeRule, `已用“${t.name}”搭好。点节点可以修改，满意后点右上角的“应用”。`)}>
+                        <span className="tag">现成的方案</span>
+                        <b>{t.name}</b>
+                        <span>{t.description}</span>
+                      </button>
+                    ))}
+                    {diskCount > 0 && (
+                      <button className="starter-card" onClick={() => void fromConfig()}>
+                        <span className="tag">你已有的</span>
+                        <b>从现在的配置开始</b>
+                        <span>
+                          {projectCwd ? '这个项目' : 'Claude Code '}里已经有 {diskCount} 个子 agent 的定义，读出来接着改。
+                        </span>
+                      </button>
+                    )}
+                    <button
+                      className="starter-card"
+                      onClick={() =>
+                        addNode('agent', {
+                          x: main.x + BW + 120 + BW / 2,
+                          y: main.y + 20,
+                        })
+                      }
+                    >
+                      <span className="tag">自己来</span>
+                      <b>加第一个子 agent</b>
+                      <span>从空白开始，自己写它什么时候用、能用哪些工具、怎么干活。</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <div
+                className="canvas-layer"
+                style={{
+                  transform: `translate(${cv.view.x}px, ${cv.view.y}px) scale(${cv.view.k})`,
+                  transition: moving ? 'none' : undefined,
+                }}
+              >
+                <svg className="canvas-lines" width="1" height="1" data-nopan>
+                  {graph.nodes
+                    .filter((n) => linked.has(n.id))
+                    .map((n) => {
+                      const s = socketOf(n, main);
+                      const d = noodle(s.from, s.to);
+                      const sel = selected?.t === 'link' && selected.id === n.id;
+                      return (
+                        <g key={n.id} style={{ ['--lc' as string]: s.color }}>
+                          <path className={`link ${sel ? 'selected' : ''}`} d={d} />
+                          <path
+                            className="link-hit"
+                            d={d}
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelected({ t: 'link', id: n.id });
+                            }}
+                          >
+                            <title>点击选中这条连线，按 Delete 或点中间的 × 断开</title>
+                          </path>
+                        </g>
+                      );
+                    })}
+                  {projectCwd && graph.globalPos && (
+                    <g style={{ ['--lc' as string]: 'var(--text-3)' }}>
+                      <path className="link inherited" d={noodle({ x: graph.globalPos.x + GLOBAL_W, y: graph.globalPos.y + portY(0) }, { x: main.x, y: main.y + portY(2) })} />
+                    </g>
+                  )}
+                  {draft && <path className="link-draft" d={noodle(draft.start, draft.cursor)} style={{ ['--lc' as string]: draft.color }} />}
+                </svg>
+
+                {projectCwd && graph.globalPos && (
+                  <Positioned at={graph.globalPos} from={main} w={GLOBAL_W} delay={0} moving={drag.movingId === 'global'} onPointerDown={(e) => drag.start(e, 'global', graph.globalPos!)}>
+                    <div className="bnode global" style={{ ['--nc' as string]: 'var(--text-3)' }} onClick={(e) => e.stopPropagation()}>
+                      <div className="bnode-head">
+                        <span className="kind" />
+                        <b>全局方案</b>
+                        <span className="spacer" />
+                        <button className="head-link" onClick={onGoGlobal} title="切换到全局方案的画布">
+                          去编辑
+                        </button>
+                      </div>
+                      <div className="bnode-ports">
+                        <div className="bnode-port">
+                          <span />
+                          <span>在这个项目里同样可用</span>
+                          <span className="socket out" style={{ ['--sc' as string]: 'var(--text-3)', cursor: 'default' }} />
+                        </div>
+                      </div>
+                      <div className="gl-list">
+                        {(globalScheme?.main.model || globalScheme?.main.effort || globalScheme?.advisor.model) && (
+                          <div className="gl-row">
+                            <span className="k">主会话</span>
+                            <span className="v">
+                              {[globalScheme.main.model && shortModel(globalScheme.main.model), globalScheme.main.effort, globalScheme.advisor.model && `advisor ${shortModel(globalScheme.advisor.model)}`]
+                                .filter(Boolean)
+                                .join(' · ')}
+                            </span>
+                          </div>
+                        )}
+                        {!globalScheme && <div className="gl-empty">正在读取全局方案…</div>}
+                        {globalScheme && globalAgents.length === 0 && <div className="gl-empty">全局方案里还没有子 agent。</div>}
+                        {globalAgents.map((a) => {
+                          const over = overridden.has(a.name);
+                          return (
+                            <div key={a.name} className={`gl-row ${over ? 'over' : ''}`} title={a.description ?? a.note ?? ''}>
+                              <span className="k mono">{a.name}</span>
+                              <span className="v">{over ? '已在这个项目里改写' : [a.model ? shortModel(a.model) : '跟主会话一样', a.effort].filter(Boolean).join(' · ')}</span>
+                              {!over && !isBuiltin(a.name) && (
+                                <button className="head-link" onClick={() => override(a)} title="复制一份到这个项目里，之后的修改只影响这个项目">
+                                  改写
+                                </button>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                      <div className="bnode-note">全局的内容在这个项目里照常生效。想让某个子 agent 在这个项目里不一样，点“改写”。</div>
+                    </div>
+                  </Positioned>
+                )}
+
+                {selected?.t === 'link' &&
+                  (() => {
+                    const n = graph.nodes.find((x) => x.id === selected.id);
+                    if (!n) return null;
+                    const s = socketOf(n, main);
+                    return (
+                      <button
+                        className="link-x"
+                        data-nopan
+                        style={{
+                          left: (s.from.x + s.to.x) / 2,
+                          top: (s.from.y + s.to.y) / 2,
+                        }}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          unlink(n.id);
+                        }}
+                        title="断开这条连线"
+                        aria-label="断开这条连线"
+                      >
+                        ✕
+                      </button>
+                    );
+                  })()}
+
+                {graph.nodes.map((n, i) => {
+                  const isLinked = n.kind === 'main' || linked.has(n.id);
+                  const nodeIssues = issues.get(n.id);
+                  const nameErr = nodeIssues?.find((x) => x.field === 'name');
+                  const descErr = nodeIssues?.find((x) => x.field === 'description');
+                  const state = nodeState(n, isLinked, nodeIssues, report);
+                  const sel = selected?.t === 'node' && selected.id === n.id;
+                  const name = n.name.trim();
+                  const builtin = n.kind === 'agent' && isBuiltin(name);
+                  const color = colorOf(n);
+                  return (
+                    <Positioned key={n.id} at={n} from={main} w={BW} delay={Math.min(i, 8) * 40} moving={drag.movingId === n.id} onPointerDown={(e) => drag.start(e, n.id, n)}>
+                      <div
+                        className={`bnode ${n.kind} ${sel ? 'selected' : ''} ${isLinked ? '' : 'loose'} ${state === 'invalid' ? 'invalid' : ''}`}
+                        style={{ ['--nc' as string]: color }}
+                        data-bnode={n.id}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          if ((e.target as HTMLElement).closest('input, select, textarea, button, label')) {
+                            // 在节点上直接改下拉框时只选中，不抢焦点
+                            setSelected({ t: 'node', id: n.id });
+                            setFocus(null);
+                            return;
+                          }
+                          select(n.id);
+                        }}
+                      >
+                        <div className="bnode-head">
+                          <span className="kind" />
+                          <b>{n.kind === 'agent' ? name || '未命名的子 agent' : KIND_LABEL[n.kind]}</b>
+                          <span className="spacer" />
+                          {state !== 'none' && (
+                            <span className={`state-chip ${state}`} title={state === 'draft' ? '没有连到主会话，不属于方案' : undefined}>
+                              {STATE_LABEL[state]}
+                            </span>
+                          )}
+                          {n.kind !== 'main' && (
+                            <button
+                              className="x"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                removeNode(n.id);
+                              }}
+                              title="从画布上删除这个节点"
+                              aria-label="从画布上删除这个节点"
+                            >
+                              ✕
+                            </button>
+                          )}
+                        </div>
+
+                        <div className="bnode-ports">
+                          {n.kind === 'main' ? (
+                            <>
+                              <div className="bnode-port">
+                                <span
+                                  className={`socket in ${graph.nodes.some((x) => x.kind === 'advisor' && linked.has(x.id)) ? '' : 'open'}`}
+                                  style={{
+                                    ['--sc' as string]: KIND_COLOR.advisor,
+                                  }}
+                                  data-port="advisor"
+                                  onPointerDown={(e) => startLink(e, n)}
+                                  title={hasAdvisor ? 'advisor 接在这里' : '从这里拖出来，加一个 advisor'}
+                                />
+                                <span>advisor</span>
+                                <span>子 agent</span>
+                                <span
+                                  className={`socket out ${graph.nodes.some((x) => x.kind === 'agent' && linked.has(x.id)) ? '' : 'open'}`}
+                                  style={{
+                                    ['--sc' as string]: KIND_COLOR.agent,
+                                  }}
+                                  data-port="agent"
+                                  onPointerDown={(e) => startLink(e, n)}
+                                  title="从这里拖出连线，连到子 agent；拖到空白处可以新建一个"
+                                />
+                              </div>
+                              <div className="bnode-port">
+                                <span
+                                  className={`socket in ${ruleLinked ? '' : 'open'}`}
+                                  style={{
+                                    ['--sc' as string]: KIND_COLOR.rule,
+                                  }}
+                                  data-port="rule"
+                                  onPointerDown={(e) => startLink(e, n)}
+                                  title={hasRule ? 'CLAUDE.md 规则接在这里' : '从这里拖出来，加一条 CLAUDE.md 规则'}
+                                />
+                                <span>规则</span>
+                              </div>
+                              {projectCwd && (
+                                <div className="bnode-port">
+                                  <span className="socket in" style={{ ['--sc' as string]: 'var(--text-3)', cursor: 'default' }} title="全局方案的内容在这个项目里同样生效" />
+                                  <span>全局方案</span>
+                                </div>
+                              )}
+                            </>
+                          ) : (
+                            <div className="bnode-port">
+                              {n.kind === 'agent' ? (
+                                <>
+                                  <span
+                                    className={`socket in ${isLinked ? '' : 'open'}`}
+                                    style={{ ['--sc' as string]: color }}
+                                    data-port="in"
+                                    onPointerDown={(e) => startLink(e, n)}
+                                    title="从这里拖到主会话，把这个子 agent 接上"
+                                  />
+                                  <span>由主会话派发</span>
+                                  {!builtin && canSpawn(n) && <span className="dim">可再派发</span>}
+                                </>
+                              ) : (
+                                <>
+                                  <span />
+                                  <span>接到主会话</span>
+                                  <span
+                                    className={`socket out ${isLinked ? '' : 'open'}`}
+                                    style={{ ['--sc' as string]: color }}
+                                    data-port="out"
+                                    onPointerDown={(e) => startLink(e, n)}
+                                    title="从这里拖到主会话"
+                                  />
+                                </>
+                              )}
+                            </div>
+                          )}
+                        </div>
+
+                        <div className="bnode-body">
+                          {n.kind === 'agent' && (
+                            <>
+                              <label htmlFor={`${n.id}-name`}>名字</label>
+                              <input
+                                id={`${n.id}-name`}
+                                className={`input mono ${nameErr ? 'invalid' : ''}`}
+                                value={n.name}
+                                placeholder="如 explorer"
+                                spellCheck={false}
+                                onChange={(e) => patch(n.id, { name: e.target.value })}
+                              />
+                              {nameErr && <div className="err">{nameErr.text}</div>}
+                            </>
+                          )}
+                          {n.kind !== 'rule' && (
+                            <>
+                              <label htmlFor={`${n.id}-model`}>模型</label>
+                              <ModelInput
+                                id={`${n.id}-model`}
+                                value={n.model}
+                                onChange={(v) => patch(n.id, { model: v })}
+                                emptyLabel={n.kind === 'agent' ? '跟主会话一样' : n.kind === 'advisor' ? '还没选' : projectCwd ? '跟全局一样' : '不指定'}
+                                placeholder="如 claude-opus-5-5"
+                              />
+                            </>
+                          )}
+                          {(n.kind === 'main' || n.kind === 'agent') && (
+                            <>
+                              <label htmlFor={`${n.id}-effort`}>effort</label>
+                              <EffortSelect
+                                id={`${n.id}-effort`}
+                                value={n.effort}
+                                onChange={(v) => patch(n.id, { effort: v })}
+                                emptyLabel={n.kind === 'agent' ? '跟主会话一样' : projectCwd ? '跟全局一样' : '不指定'}
+                                allowMax={n.kind === 'agent'}
+                              />
+                            </>
+                          )}
+                          {n.kind === 'main' && (
+                            <label className="switch full" title="关闭后，实际运行时派发了 Explore、Plan 这类内置类型会被标为“预设外”。这个开关只影响检查，不会禁止主会话使用内置类型">
+                              <input
+                                type="checkbox"
+                                checked={graph.allowBuiltins}
+                                onChange={(e) =>
+                                  update((g) => ({
+                                    ...g,
+                                    allowBuiltins: e.target.checked,
+                                  }))
+                                }
+                              />
+                              内置类型也算符合方案
+                            </label>
+                          )}
+                        </div>
+
+                        {n.kind === 'agent' && !builtin && (
+                          <div className="bnode-rows">
+                            <button
+                              className={`bnode-row ${descErr ? 'bad' : ''}`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                select(n.id, 'when');
+                              }}
+                            >
+                              <span className="k">什么时候用</span>
+                              <span className="v clamp">{n.description.trim() || '还没写'}</span>
+                            </button>
+                            <button
+                              className="bnode-row"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                select(n.id, 'tools');
+                              }}
+                            >
+                              <span className="k">工具</span>
+                              <span className="v">{toolSummary(n)}</span>
+                            </button>
+                            <button
+                              className={`bnode-row ${n.prompt.trim() ? '' : 'warn'}`}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                select(n.id, 'prompt');
+                              }}
+                            >
+                              <span className="k">提示词</span>
+                              <span className="v">{promptSummary(n.prompt) ?? '还没写'}</span>
+                            </button>
+                          </div>
+                        )}
+                        {n.kind === 'agent' && builtin && <div className="bnode-note">内置类型，没有定义文件。放在这里只用来检查它实际用的模型。</div>}
+                        {n.kind === 'advisor' && <div className="bnode-note">更强的模型当顾问。主会话拿不准时向它请教，它只给建议，不动手。</div>}
+                        {n.kind === 'rule' && (
+                          <button
+                            className="bnode-note as-btn"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              select(n.id, 'prompt');
+                            }}
+                          >
+                            往 CLAUDE.md 里加一段话，告诉主会话什么时候该请教 advisor。点这里看内容。
+                          </button>
+                        )}
+                      </div>
+                    </Positioned>
+                  );
+                })}
+              </div>
+
+              {menu && (
+                <div className="menu" style={{ left: menu.at.x, top: menu.at.y }} data-nopan role="menu">
+                  {menu.mode === 'add' ? (
+                    <>
+                      <h4>子 agent</h4>
+                      <button style={{ ['--nc' as string]: KIND_COLOR.agent }} onClick={() => addNode('agent', menu.place)}>
+                        <i />
+                        空白的子 agent
+                        <span>自己写</span>
+                      </button>
+                      {agentTemplates.map((t) => (
+                        <button
+                          key={t.name}
+                          style={{ ['--nc' as string]: KIND_COLOR.agent }}
+                          disabled={graph.nodes.some((n) => n.kind === 'agent' && n.name.trim() === t.name)}
+                          onClick={() => {
+                            const d = (disk ?? []).find((a) => a.name === t.name);
+                            // 磁盘上已经有同名的定义时用磁盘上的内容，避免覆盖用户自己写的
+                            addNode('agent', menu.place, {
+                              name: t.name,
+                              description: d?.description ?? t.description,
+                              tools: d ? (d.tools ?? null) : t.tools,
+                              disallowedTools: d ? (d.disallowedTools ?? null) : t.disallowedTools,
+                              prompt: d?.prompt ?? t.prompt,
+                              ...(d ? { model: d.model, effort: d.effort } : {}),
+                            });
+                          }}
+                        >
+                          <i />
+                          {t.name}
+                          <span>{t.label}</span>
+                        </button>
+                      ))}
+                      {(disk ?? [])
+                        .filter((d) => !agentTemplates.some((t) => t.name === d.name) && !graph.nodes.some((n) => n.kind === 'agent' && n.name.trim() === d.name))
+                        .slice(0, 6)
+                        .map((d) => (
+                          <button
+                            key={d.name}
+                            style={{ ['--nc' as string]: KIND_COLOR.agent }}
+                            onClick={() =>
+                              addNode('agent', menu.place, {
+                                name: d.name,
+                                model: d.model,
+                                effort: d.effort,
+                                description: d.description ?? '',
+                                tools: d.tools ?? null,
+                                disallowedTools: d.disallowedTools ?? null,
+                                prompt: d.prompt ?? '',
+                              })
+                            }
+                          >
+                            <i />
+                            {d.name}
+                            <span>已有的定义</span>
+                          </button>
+                        ))}
+                      <h4>接到主会话的输入</h4>
+                      <button style={{ ['--nc' as string]: KIND_COLOR.advisor }} disabled={hasAdvisor} onClick={() => addNode('advisor', menu.place)}>
+                        <i />
+                        advisor
+                        <span>{hasAdvisor ? '已经有了' : '更强的模型当顾问'}</span>
+                      </button>
+                      <button style={{ ['--nc' as string]: KIND_COLOR.rule }} disabled={hasRule} onClick={() => addNode('rule', menu.place)}>
+                        <i />
+                        CLAUDE.md 规则
+                        <span>{hasRule ? '已经有了' : '何时请教 advisor'}</span>
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <h4>换一个方案</h4>
+                      {(templatesQ.data ?? []).map((t) => (
+                        <button
+                          key={t.id}
+                          style={{ ['--nc' as string]: 'var(--accent)' }}
+                          onClick={() => replaceWith(t.preset, t.includeRule, `已用“${t.name}”搭好。现在还没有写入。`)}
+                          title={t.description}
+                        >
+                          <i />
+                          {t.name}
+                          <span>现成的</span>
+                        </button>
+                      ))}
+                      <button style={{ ['--nc' as string]: 'var(--info)' }} onClick={() => void fromConfig()} title="读取 Claude Code 现在的设置和定义文件，搭成图">
+                        <i />
+                        读取现在的配置
+                      </button>
+                      <h4>这个方案</h4>
+                      <button
+                        style={{ ['--nc' as string]: 'var(--text-3)' }}
+                        disabled={!dirty}
+                        onClick={() => {
+                          if (!saved) return;
+                          setGraph(
+                            graphFromPreset(
+                              saved,
+                              {
+                                ...loadStored(projectCwd),
+                                loose: [],
+                                rule: !!ruleQ.data?.enabled,
+                              },
+                              disk ?? [],
+                            ),
+                          );
+                          setSelected(null);
+                          setMenu(null);
+                          refit();
+                        }}
+                        title="回到上次保存或应用时的样子"
+                      >
+                        <i />
+                        撤销修改
+                      </button>
+                      <button
+                        style={{ ['--nc' as string]: 'var(--text-3)' }}
+                        disabled={!dirty || blocking}
+                        onClick={() => void save()}
+                        title="只把方案存成检查标准，不修改 Claude Code 的配置。适合只想检查、不想让 agentree 改配置的情况"
+                      >
+                        <i />
+                        只保存，不写入
+                        <span>仅用于检查</span>
+                      </button>
+                      <button
+                        style={{ ['--nc' as string]: 'var(--text-3)' }}
+                        disabled={!current || blocking}
+                        onClick={() => {
+                          setMenu(null);
+                          if (current) setCommand(launchCommand(current, projectCwd));
+                        }}
+                        title="生成一条命令行启动命令：只对那一次会话生效，不写入任何文件"
+                      >
+                        <i />
+                        只用一次
+                        <span>命令行</span>
+                      </button>
+                      {projectCwd && (
+                        <button style={{ ['--nc' as string]: 'var(--fail)' }} onClick={() => void removeScheme()} title="删除 agentree 里这个项目的方案，不动项目目录里的文件">
+                          <i />
+                          删除这个项目的方案
+                        </button>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
+            </>
+          )}
+        </div>
+
+        {graph && selectedNode && (
+          <Inspector
+            key={selectedNode.id}
+            node={selectedNode}
+            color={colorOf(selectedNode)}
+            isLinked={selectedNode.kind === 'main' || linked.has(selectedNode.id)}
+            issues={issues.get(selectedNode.id) ?? []}
+            state={nodeState(selectedNode, selectedNode.kind === 'main' || linked.has(selectedNode.id), issues.get(selectedNode.id), report)}
+            report={report}
+            onDisk={existingNames.has(selectedNode.name.trim())}
+            templates={agentTemplates}
+            rule={ruleQ.data ?? null}
+            ruleText={graph.ruleText}
+            focus={focus}
+            onPatch={(p) => patch(selectedNode.id, p)}
+            onRuleText={(t) => update((g) => ({ ...g, ruleText: t }))}
+            onPull={() => void pull(selectedNode.id, selectedNode.name.trim())}
+            onRemove={() => removeNode(selectedNode.id)}
+            onClose={() => setSelected(null)}
+          />
+        )}
+        {graph && !selectedNode && panel && <EffectPanel report={report} blockers={report?.blockers ?? []} onClose={() => setPanel(false)} onApply={openApply} canApply={!blocking && !!current} />}
+      </div>
+
+      {applying && (
+        <PlanDialog
+          title={projectCwd ? `把方案写入项目 ${shortPath(projectCwd)}` : '把方案写入 Claude Code'}
+          load={loadPlan}
+          onClose={() => {
+            setApplying(null);
+            setTick((t) => t + 1);
+          }}
+          onApplied={(r) => {
+            void configQ.refresh();
+            void ruleQ.refresh();
+            void readDisk();
+            if (r.failed.length > 0) return;
+            // 后端会把应用的方案同时存成检查标准；旧后端不返回时这里补存一次
+            if (r.preset) setSaved(r.preset);
+            else void api.savePreset(applying.preset, projectCwd).then(setSaved, () => {});
+            onSchemesChanged();
+            setSelected(null);
+            setPanel(true);
+          }}
+          nextSteps={
+            <ol className="next-steps">
+              <li>
+                <b>{projectCwd ? '在这个项目目录下新开一个会话。' : '新开一个会话。'}</b>
+                已经开着的会话不一定会加载新的定义，新开的一定会。
+              </li>
+              <li>
+                <b>正常使用。</b>想马上试某个子 agent，可以在对话里输入 <span className="mono">@agent-名字</span> 加上任务，直接点名。
+              </li>
+              <li>
+                <b>回到这里看状态。</b>
+                节点上的标记会从“已写入”变成“已加载”，被派发过之后变成“已生效”。
+              </li>
+            </ol>
+          }
+        />
+      )}
+
+      {command !== null && (
+        <Modal
+          title="只用一次：命令行启动命令"
+          onCancel={() => setCommand(null)}
+          width={860}
+          footer={
+            <>
+              <span className="small muted">在 PowerShell 里粘贴运行</span>
+              <span className="spacer" />
+              <button
+                className="btn"
+                onClick={() => {
+                  void navigator.clipboard.writeText(command).then(
+                    () => setToast({ kind: 'ok', text: '命令已复制' }),
+                    () => setToast({ kind: 'error', text: '复制失败，请手动选中文本复制' }),
+                  );
+                }}
+              >
+                复制
+              </button>
+              <button className="btn primary" onClick={() => setCommand(null)}>
+                关闭
+              </button>
+            </>
+          }
+        >
+          <div className="stack" style={{ gap: 12 }}>
+            <div className="small muted" style={{ lineHeight: 1.7 }}>
+              用这条命令启动的会话会带上画布上的子 agent、主模型和 effort，<b>只对这一次会话有效</b>，不写入任何文件，也不影响全局方案和项目方案。
+              <br />
+              这是 Claude Code 命令行才有的功能。桌面版启动会话时没有对应的入口，想在桌面版里给某些会话单独一套方案，请用项目方案。
+            </div>
+            <textarea className="textarea mono" readOnly value={command} style={{ minHeight: '46vh', resize: 'none' }} spellCheck={false} onFocus={(e) => e.currentTarget.select()} />
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/** 生成只对一次会话生效的命令行启动命令（PowerShell 写法） */
+function launchCommand(p: Preset, cwd: string | null): string {
+  const list = (v: string | null | undefined) =>
+    (v ?? '')
+      .split(',')
+      .map((t) => t.trim())
+      .filter(Boolean);
+  const agents: Record<string, Record<string, unknown>> = {};
+  for (const a of p.agents) {
+    if (isBuiltin(a.name)) continue;
+    const def: Record<string, unknown> = { description: a.description ?? a.note ?? a.name, prompt: a.prompt ?? '' };
+    if (a.tools) def.tools = list(a.tools);
+    if (a.disallowedTools) def.disallowedTools = list(a.disallowedTools);
+    if (a.model) def.model = a.model;
+    if (a.effort) def.effort = a.effort;
+    agents[a.name] = def;
+  }
+  const args = ['claude'];
+  if (p.main.model) args.push('--model', p.main.model);
+  if (p.main.effort) args.push('--effort', p.main.effort);
+  const lines: string[] = [];
+  if (cwd) lines.push(`Set-Location "${cwd}"`);
+  if (Object.keys(agents).length) lines.push(`${args.join(' ')} --agents @'`, JSON.stringify(agents, null, 2), "'@");
+  else lines.push(args.join(' '));
+  return lines.join('\n');
+}
+
+/**
+ * 搭建页外层：决定现在编辑的是哪份方案。
+ * 切换范围时整个画布重新挂载；每个范围没应用的修改各自存在本机，切来切去不会丢。
+ */
+export default function BuilderPage() {
+  const configQ = useApi<ClaudeConfigSnapshot>('config', api.config);
+  const schemesQ = useApi<SchemeInfo[]>('schemes', api.presets);
+  const [cwd, setCwd] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(SCOPE_KEY) || null;
+    } catch {
+      return null;
+    }
+  });
+
+  const projects = useMemo(() => {
+    const out: { cwd: string; has: boolean }[] = [];
+    for (const sc of schemesQ.data ?? []) if (sc.scope === 'project' && sc.projectCwd) out.push({ cwd: sc.projectCwd, has: true });
+    for (const c of configQ.data?.projectCwds ?? []) if (!out.some((p) => samePath(p.cwd, c))) out.push({ cwd: c, has: false });
+    return out;
+  }, [schemesQ.data, configQ.data]);
+
+  const choose = useCallback((v: string | null) => {
+    setCwd(v);
+    try {
+      if (v) localStorage.setItem(SCOPE_KEY, v);
+      else localStorage.removeItem(SCOPE_KEY);
+    } catch {
+      /* 忽略 */
+    }
+  }, []);
+
+  // 记住的项目已经不在列表里了（比如索引被清空），回到全局方案
+  useEffect(() => {
+    if (cwd && configQ.data && schemesQ.data && !projects.some((p) => samePath(p.cwd, cwd))) choose(null);
+  }, [cwd, configQ.data, schemesQ.data, projects, choose]);
+
+  const scopeBar = (
+    <div className="scope-bar" title={cwd ?? '全局方案对所有项目生效'}>
+      <select className="select" value={cwd ?? ''} onChange={(e) => choose(e.target.value || null)} aria-label="方案的范围">
+        <option value="">全局方案 · 所有项目</option>
+        {projects.some((p) => p.has) && (
+          <optgroup label="有自己方案的项目">
+            {projects
+              .filter((p) => p.has)
+              .map((p) => (
+                <option key={p.cwd} value={p.cwd}>
+                  {shortPath(p.cwd)}
+                </option>
+              ))}
+          </optgroup>
+        )}
+        {projects.some((p) => !p.has) && (
+          <optgroup label="给项目单独搭一份">
+            {projects
+              .filter((p) => !p.has)
+              .map((p) => (
+                <option key={p.cwd} value={p.cwd}>
+                  {shortPath(p.cwd)}
+                </option>
+              ))}
+          </optgroup>
+        )}
+      </select>
+    </div>
+  );
+
+  return <BuilderCanvas key={cwd ?? ''} projectCwd={cwd} scopeBar={scopeBar} onSchemesChanged={() => void schemesQ.refresh()} onGoGlobal={() => choose(null)} />;
+}

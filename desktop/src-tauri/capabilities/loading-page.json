@@ -1,0 +1,8 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "loading-page",
+  "description": "只有本地加载页面可以查询启动状态和重试。没有 remote 配置，所以 http://127.0.0.1 上的页面无法调用任何命令。",
+  "local": true,
+  "windows": ["main"],
+  "permissions": ["allow-get-status", "allow-retry"]
+}

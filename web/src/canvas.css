@@ -1,0 +1,877 @@
+/*
+ * 节点画布：会话详情的运行树和搭建页的节点编辑器共用。
+ * 交互参考 ComfyUI：无限画布，节点自由拖动，接口之间用曲线相连。
+ */
+
+/* ───────── 画布 ───────── */
+.canvas {
+  position: relative;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+  background-color: var(--canvas-bg);
+  /* 细格加粗格，缩放时有参照 */
+  background-image:
+    linear-gradient(var(--grid-major) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-major) 1px, transparent 1px),
+    linear-gradient(var(--grid-minor) 1px, transparent 1px),
+    linear-gradient(90deg, var(--grid-minor) 1px, transparent 1px);
+  background-size:
+    120px 120px,
+    120px 120px,
+    24px 24px,
+    24px 24px;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+}
+:root,
+:root[data-theme='dark'] {
+  --canvas-bg: #0e0f12;
+  --grid-minor: rgba(255, 255, 255, 0.022);
+  --grid-major: rgba(255, 255, 255, 0.045);
+  --node-bg: #1b1e24;
+  --node-head: #262a32;
+  --socket-ring: #0e0f12;
+  --c-advisor: #b48cff;
+  --c-rule: #f2b84b;
+  --c-agent: #6fdc8c;
+}
+:root[data-theme='light'] {
+  --canvas-bg: #eef0f3;
+  --grid-minor: rgba(15, 23, 42, 0.035);
+  --grid-major: rgba(15, 23, 42, 0.07);
+  --node-bg: #ffffff;
+  --node-head: #f1f3f6;
+  --socket-ring: #eef0f3;
+  --c-advisor: #8454e0;
+  --c-rule: #b7791f;
+  --c-agent: #1f9d55;
+}
+.canvas.dragging {
+  cursor: grabbing;
+}
+.canvas-layer {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 0;
+  height: 0;
+  transform-origin: 0 0;
+  transition: transform var(--t3) var(--ease);
+}
+.canvas.dragging .canvas-layer,
+.canvas.wheeling .canvas-layer {
+  transition: none;
+}
+.canvas-lines {
+  position: absolute;
+  left: 0;
+  top: 0;
+  overflow: visible;
+  pointer-events: none;
+}
+.canvas-lines path {
+  fill: none;
+  stroke: var(--edge);
+  stroke-width: 2;
+  stroke-linecap: round;
+  transition:
+    d var(--t3) var(--ease),
+    stroke var(--t3),
+    stroke-width var(--t2),
+    opacity var(--t2);
+}
+/* 拖动节点时连线要紧跟节点，不能有延迟 */
+.canvas.node-moving .canvas-lines path {
+  transition: none;
+}
+.canvas-lines path.edge {
+  stroke: color-mix(in srgb, var(--lc, var(--edge)) 55%, var(--edge));
+  stroke-dasharray: 1;
+  animation: draw-in var(--t4) var(--ease) both;
+}
+.canvas-lines path.edge.live {
+  stroke: color-mix(in srgb, var(--running) 60%, var(--edge));
+}
+.canvas-lines path.edge.on-path {
+  stroke: var(--lc, var(--text-2));
+  stroke-width: 2.6;
+}
+/* 沿连线流向子节点的光点：这个子 agent 正在工作 */
+.canvas-lines path.packet {
+  stroke: var(--running);
+  stroke-width: 3;
+  stroke-dasharray: 0.08 0.92;
+  filter: drop-shadow(0 0 4px var(--running));
+  animation: packet 1.6s linear infinite;
+}
+@keyframes packet {
+  from {
+    stroke-dashoffset: 1;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+.canvas-lines path.advisor {
+  stroke-width: 1.5;
+  stroke-dasharray: 3 4;
+  animation: fade-in var(--t4) var(--ease) 200ms both;
+}
+
+/* 浮动工具条 */
+.canvas-tools {
+  position: absolute;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--glass);
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
+  box-shadow: var(--shadow-2);
+  cursor: default;
+  animation: rise-in var(--t3) var(--ease) both;
+}
+.canvas-tools.tl {
+  left: 18px;
+  top: 16px;
+}
+.canvas-tools.tr {
+  right: 18px;
+  top: 16px;
+}
+.canvas-tools.bl {
+  left: 18px;
+  bottom: 16px;
+}
+.canvas-tools.br {
+  right: 18px;
+  bottom: 16px;
+}
+.canvas-tools .sep {
+  flex: none;
+  width: 1px;
+  height: 18px;
+  margin: 0 2px;
+  background: var(--line-strong);
+}
+.canvas-tools .btn:not(.primary) {
+  border-color: transparent;
+  background: transparent;
+}
+.canvas-tools .btn:not(.primary):hover:not(:disabled) {
+  background: var(--hover);
+}
+.canvas-tools .zoom {
+  min-width: 52px;
+  font-family: var(--mono);
+  font-size: 12px;
+}
+.canvas-tools .seg {
+  padding: 0;
+  background: transparent;
+}
+.canvas-tools .seg-thumb {
+  top: 0;
+  bottom: 0;
+}
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 5px 14px;
+  padding: 3px 9px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.legend > span {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+/* ───────── 定位层 ───────── */
+.tpos {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transition:
+    transform var(--t3) var(--ease),
+    opacity var(--t3) var(--ease);
+  transition-delay: var(--d, 0ms);
+}
+.tpos.entering {
+  opacity: 0;
+}
+.tpos.moving {
+  z-index: 4;
+  transition: none;
+}
+.canvas.dragging .tpos {
+  transition: none;
+}
+
+/* ───────── 节点 ───────── */
+.node {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  border-radius: 10px;
+  border: 1px solid var(--line-strong);
+  background: var(--node-bg);
+  box-shadow: var(--shadow-2);
+  font-size: 12.5px;
+  cursor: grab;
+  transition:
+    border-color var(--t2),
+    box-shadow var(--t2),
+    transform var(--t3) var(--spring);
+  transition-delay: var(--d, 0ms);
+}
+.tpos.entering > .node,
+.tpos.entering > .bnode {
+  transform: scale(0.88);
+}
+.tpos.moving > .node,
+.tpos.moving > .bnode {
+  cursor: grabbing;
+  box-shadow: var(--shadow-3);
+  transform: scale(1.02);
+}
+.node:hover {
+  border-color: var(--text-3);
+}
+.node:focus-visible {
+  outline: none;
+  border-color: var(--focus);
+}
+.node.selected {
+  border-color: var(--focus);
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--focus) 24%, transparent),
+    var(--shadow-2);
+}
+.node-head {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  height: 28px;
+  min-width: 0;
+  padding: 0 8px 0 12px;
+  border-radius: 9px 9px 0 0;
+  /* 标题栏带一点模型的颜色 */
+  background: color-mix(in srgb, var(--mc, var(--text-3)) 22%, var(--node-head));
+}
+.node-type {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+.node-tag {
+  flex: none;
+  padding: 0 5px;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.22);
+  color: var(--text-2);
+  font-size: 11px;
+  line-height: 16px;
+}
+:root[data-theme='light'] .node-tag {
+  background: rgba(255, 255, 255, 0.6);
+}
+.node-body {
+  position: relative;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+  min-height: 0;
+  padding: 0 12px;
+  overflow: hidden;
+  border-radius: 0 0 9px 9px;
+}
+.node-body > * {
+  position: relative;
+}
+/* 用量占比画在节点背景上：条越长，这个 agent 用得越多 */
+.node .fill-bar {
+  position: absolute;
+  inset: 0 auto 0 0;
+  background: linear-gradient(90deg, color-mix(in srgb, var(--mc, var(--text-3)) 17%, transparent), color-mix(in srgb, var(--mc, var(--text-3)) 6%, transparent));
+  transform-origin: left center;
+  animation: grow-x var(--t4) var(--ease) 200ms both;
+  transition: width var(--t4) var(--ease);
+  pointer-events: none;
+}
+.node-desc {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+.node-meta {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  color: var(--text-3);
+  font-family: var(--mono);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.node-meta .m {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--mc, var(--text-2));
+}
+.node-meta b {
+  color: var(--text);
+  font-weight: 600;
+}
+.node-meta .flash {
+  display: inline-flex;
+  gap: 3px;
+}
+
+/* 接口：连线接在这里 */
+.socket {
+  position: absolute;
+  z-index: 2;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2.5px solid var(--socket-ring);
+  background: var(--sc, var(--mc, var(--text-3)));
+  transition:
+    transform var(--t2) var(--spring),
+    box-shadow var(--t2);
+}
+.node .socket.in {
+  left: -6px;
+  top: 8px;
+}
+.node .socket.out {
+  right: -6px;
+  top: 8px;
+}
+.node.v .socket.in {
+  left: calc(50% - 6px);
+  top: -6px;
+}
+.node.v .socket.out {
+  left: calc(50% - 6px);
+  right: auto;
+  top: auto;
+  bottom: -6px;
+}
+.node .socket.out.folded {
+  background: var(--socket-ring);
+  box-shadow: inset 0 0 0 2px var(--info);
+}
+
+.fold {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex: none;
+  height: 19px;
+  padding: 0 6px;
+  border: none;
+  border-radius: 10px;
+  background: rgba(0, 0, 0, 0.24);
+  color: var(--text-2);
+  font-family: var(--mono);
+  font-size: 11px;
+  cursor: pointer;
+  transition:
+    background-color var(--t1),
+    color var(--t1),
+    transform var(--t1);
+}
+:root[data-theme='light'] .fold {
+  background: rgba(255, 255, 255, 0.65);
+}
+.fold:hover {
+  color: var(--text);
+}
+.fold:active {
+  transform: scale(0.92);
+}
+.fold.folded {
+  background: var(--info-bg);
+  color: var(--info);
+}
+.fold svg {
+  width: 9px;
+  height: 9px;
+  stroke: currentColor;
+  stroke-width: 2.2;
+  fill: none;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transition: transform var(--t2) var(--ease);
+}
+.fold.folded svg {
+  transform: rotate(-90deg);
+}
+
+.node.main {
+  border-color: color-mix(in srgb, var(--mc, var(--accent)) 55%, var(--line-strong));
+}
+.node.main.selected {
+  border-color: var(--focus);
+}
+.node.failed {
+  border-color: color-mix(in srgb, var(--fail) 60%, var(--line-strong));
+}
+.node.stopped {
+  border-color: color-mix(in srgb, var(--stopped) 55%, var(--line-strong));
+}
+.node.unknown {
+  border-style: dashed;
+}
+.node.running {
+  border-color: color-mix(in srgb, var(--running) 70%, var(--line-strong));
+  animation: breathe 2.4s ease-in-out infinite;
+}
+.node.running.selected {
+  border-color: var(--focus);
+  animation: none;
+}
+@keyframes breathe {
+  0%,
+  100% {
+    box-shadow:
+      0 0 0 0 transparent,
+      var(--shadow-2);
+  }
+  50% {
+    box-shadow:
+      0 0 22px 0 color-mix(in srgb, var(--running) 36%, transparent),
+      var(--shadow-2);
+  }
+}
+
+/* advisor：挂在主会话旁边的小标签 */
+.advisor-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  height: 100%;
+  padding: 0 12px;
+  border-radius: 17px;
+  border: 1px dashed color-mix(in srgb, var(--c-advisor) 55%, transparent);
+  background: color-mix(in srgb, var(--c-advisor) 9%, var(--node-bg));
+  color: var(--text-2);
+  font-size: 12px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: border-color var(--t2);
+}
+.advisor-chip:hover {
+  border-color: var(--c-advisor);
+}
+.advisor-chip b {
+  color: var(--text);
+  font-family: var(--mono);
+  font-weight: 600;
+}
+.advisor-chip.zero {
+  border-color: color-mix(in srgb, var(--warn) 65%, transparent);
+  background: color-mix(in srgb, var(--warn) 10%, var(--node-bg));
+  color: var(--warn);
+}
+.advisor-chip.zero b {
+  color: var(--warn);
+}
+
+/* ───────── 搭建页的节点 ───────── */
+.bnode {
+  position: relative;
+  width: 100%;
+  border-radius: 10px;
+  border: 1px solid var(--line-strong);
+  background: var(--node-bg);
+  box-shadow: var(--shadow-2);
+  font-size: 12.5px;
+  cursor: grab;
+  transition:
+    border-color var(--t2),
+    box-shadow var(--t2),
+    transform var(--t3) var(--spring),
+    opacity var(--t2);
+}
+.bnode:hover {
+  border-color: var(--text-3);
+}
+.bnode.selected {
+  border-color: var(--focus);
+  box-shadow:
+    0 0 0 3px color-mix(in srgb, var(--focus) 24%, transparent),
+    var(--shadow-2);
+}
+.bnode.invalid {
+  border-color: var(--fail);
+}
+/* 没有连到主会话的节点不会生效，画成虚线、半透明 */
+.bnode.loose {
+  border-style: dashed;
+}
+.bnode.loose .bnode-body {
+  opacity: 0.72;
+}
+.bnode-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  height: 34px;
+  padding: 0 8px 0 12px;
+  border-radius: 9px 9px 0 0;
+  background: color-mix(in srgb, var(--nc) 26%, var(--node-head));
+}
+.bnode-head .kind {
+  flex: none;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--nc);
+}
+.bnode-head b {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+}
+.bnode-head .x {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-3);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity var(--t1),
+    background-color var(--t1),
+    color var(--t1);
+}
+.bnode:hover .bnode-head .x,
+.bnode.selected .bnode-head .x,
+.bnode-head .x:focus-visible {
+  opacity: 1;
+}
+.bnode-head .x:hover {
+  background: var(--fail-bg);
+  color: var(--fail);
+}
+/* 接口行：左边是输入，右边是输出 */
+.bnode-ports {
+  padding: 4px 0 2px;
+}
+.bnode-port {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 26px;
+  padding: 0 16px;
+  color: var(--text-2);
+  font-size: 12px;
+}
+.bnode-port .socket {
+  top: 7px;
+  cursor: crosshair;
+}
+.bnode-port .socket.in {
+  left: -6px;
+}
+.bnode-port .socket.out {
+  right: -6px;
+}
+.bnode-port .socket::after {
+  /* 把可点击的范围放大，接口本身只有 12 像素，很难点中 */
+  content: '';
+  position: absolute;
+  inset: -9px;
+  border-radius: 50%;
+}
+.bnode-port .socket:hover,
+.bnode-port .socket.target {
+  transform: scale(1.35);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--sc) 30%, transparent);
+}
+.bnode-port .socket.open {
+  background: var(--socket-ring);
+  box-shadow: inset 0 0 0 2px var(--sc);
+}
+.bnode-body {
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr);
+  align-items: center;
+  gap: 8px 10px;
+  padding: 6px 12px 12px;
+  cursor: default;
+  transition: opacity var(--t2);
+}
+.bnode-body label {
+  color: var(--text-3);
+  font-size: 12px;
+}
+.bnode-body .input,
+.bnode-body .select {
+  width: 100%;
+  height: 28px;
+  font-size: 12.5px;
+  border-radius: 7px;
+  background: var(--canvas-bg);
+}
+.bnode-body .model-input {
+  flex-direction: column;
+  gap: 6px;
+}
+.bnode-body .model-input .select,
+.bnode-body .model-input .input {
+  width: 100%;
+  min-width: 0;
+  flex: none;
+}
+.bnode-body .full {
+  grid-column: 1 / -1;
+}
+.bnode-body .hint {
+  grid-column: 1 / -1;
+  color: var(--text-3);
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+.bnode-body .err {
+  grid-column: 1 / -1;
+  color: var(--fail);
+  font-size: 12px;
+}
+.bnode-body .switch {
+  font-size: 12.5px;
+}
+
+/* 搭建页的连线可以点选和删除 */
+.canvas-lines path.link {
+  stroke: color-mix(in srgb, var(--lc) 75%, var(--edge));
+  stroke-width: 2.5;
+  pointer-events: stroke;
+  cursor: pointer;
+  animation: fade-in var(--t3) var(--ease) both;
+}
+.canvas-lines path.link:hover {
+  stroke: var(--lc);
+  stroke-width: 3.5;
+}
+.canvas-lines path.link.selected {
+  stroke: var(--lc);
+  stroke-width: 3.5;
+  filter: drop-shadow(0 0 5px var(--lc));
+}
+/* 加宽一条看不见的线，连线更容易点中 */
+.canvas-lines path.link-hit {
+  stroke: transparent;
+  stroke-width: 16;
+  pointer-events: stroke;
+  cursor: pointer;
+  transition: none;
+}
+.canvas-lines path.link-draft {
+  stroke: var(--lc);
+  stroke-width: 2.5;
+  stroke-dasharray: 6 6;
+  transition: none;
+  animation: dash-move 0.6s linear infinite;
+}
+@keyframes dash-move {
+  to {
+    stroke-dashoffset: -12;
+  }
+}
+.link-x {
+  position: absolute;
+  z-index: 3;
+  width: 22px;
+  height: 22px;
+  margin: -11px 0 0 -11px;
+  border: 1px solid var(--line-strong);
+  border-radius: 50%;
+  background: var(--node-bg);
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: var(--shadow-2);
+  animation: pop-in var(--t2) var(--spring) both;
+  transition:
+    background-color var(--t1),
+    color var(--t1);
+}
+.link-x:hover {
+  background: var(--fail);
+  border-color: var(--fail);
+  color: #fff;
+}
+
+/* 添加节点的菜单 */
+.menu {
+  position: absolute;
+  z-index: 20;
+  min-width: 250px;
+  padding: 6px;
+  border-radius: 12px;
+  border: 1px solid var(--line-strong);
+  background: var(--glass);
+  -webkit-backdrop-filter: blur(18px);
+  backdrop-filter: blur(18px);
+  box-shadow: var(--shadow-3);
+  cursor: default;
+  transform-origin: top left;
+  animation: menu-in var(--t2) var(--ease) both;
+}
+@keyframes menu-in {
+  from {
+    opacity: 0;
+    transform: scale(0.95) translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+.menu h4 {
+  padding: 6px 10px 4px;
+  color: var(--text-3);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+.menu button {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 10px;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--t1);
+}
+.menu button:hover:not(:disabled),
+.menu button:focus-visible {
+  outline: none;
+  background: var(--active);
+}
+.menu button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.menu button i {
+  flex: none;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--nc);
+}
+.menu button span {
+  color: var(--text-3);
+  font-size: 12px;
+  margin-left: auto;
+  padding-left: 14px;
+}
+
+/* 顶部的短提示 */
+.toast {
+  position: absolute;
+  z-index: 10;
+  left: 50%;
+  top: 68px;
+  max-width: min(640px, calc(100% - 48px));
+  padding: 9px 16px;
+  border-radius: 10px;
+  border: 1px solid var(--line-strong);
+  background: var(--glass);
+  -webkit-backdrop-filter: blur(14px);
+  backdrop-filter: blur(14px);
+  box-shadow: var(--shadow-2);
+  font-size: 13px;
+  cursor: default;
+  transform: translateX(-50%);
+  animation: toast-in var(--t3) var(--ease) both;
+}
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translate(-50%, -8px);
+  }
+  to {
+    opacity: 1;
+    transform: translate(-50%, 0);
+  }
+}
+.toast.ok {
+  border-color: color-mix(in srgb, var(--ok) 45%, transparent);
+  color: var(--ok);
+}
+.toast.error {
+  border-color: color-mix(in srgb, var(--fail) 45%, transparent);
+  color: var(--fail);
+}
+.dirty-dot {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 8px 0 10px;
+  color: var(--text-2);
+  font-size: 12.5px;
+  white-space: nowrap;
+}
+.dirty-dot::before {
+  content: '';
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-3);
+}
+.dirty-dot.on {
+  color: var(--warn);
+}
+.dirty-dot.on::before {
+  background: var(--warn);
+  box-shadow: 0 0 8px var(--warn);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .canvas-lines path.packet {
+    display: none;
+  }
+}

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="color-scheme" content="dark light" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%230d1117'/%3E%3Cpath d='M16 7v7M16 14l-7 6M16 14l7 6' stroke='%237ee787' stroke-width='2.5' fill='none' stroke-linecap='round'/%3E%3Ccircle cx='16' cy='7' r='3' fill='%237ee787'/%3E%3Ccircle cx='9' cy='22' r='3' fill='%2379c0ff'/%3E%3Ccircle cx='23' cy='22' r='3' fill='%23d2a8ff'/%3E%3C/svg%3E" />
+    <title>agentree</title>
+    <script>
+      try {
+        var t = localStorage.getItem('agentree.theme');
+        if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+      } catch (e) {}
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
