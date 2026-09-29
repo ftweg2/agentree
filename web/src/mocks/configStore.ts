@@ -70,6 +70,7 @@ files.set(
           },
           env: { DISABLE_TELEMETRY: '1' },
           modelSettings: { 'claude-sonnet-5': { effortLevel: 'high' } },
+          autoCompactWindow: 500000,
         },
         null,
         2,
@@ -308,6 +309,8 @@ export function settingsSnapshot() {
     model: typeof obj.model === 'string' ? obj.model : null,
     advisorModel: typeof obj.advisorModel === 'string' ? obj.advisorModel : null,
     modelEffort,
+    autoCompactWindow: typeof obj.autoCompactWindow === 'number' ? obj.autoCompactWindow : null,
+    autoCompactEnabled: typeof obj.autoCompactEnabled === 'boolean' ? obj.autoCompactEnabled : null,
   };
 }
 
@@ -370,7 +373,7 @@ export function templates(): PresetTemplate[] {
         '主会话用 Opus 5.5 高强度运行，三个子 agent 分别负责读代码、改代码、查文档，用 Opus 5.5 中等强度；Fable 5.1 作为顾问，在关键节点给建议',
       preset: {
         version: 1,
-        main: { model: 'claude-opus-5-5', effort: 'high' },
+        main: { model: 'claude-opus-5-5', effort: 'high', autoCompactWindow: null },
         advisor: { model: 'fable' },
         agents: [
           { name: 'explorer', model: 'opus', effort: 'medium', note: '读代码' },
@@ -443,6 +446,21 @@ function setTop(d: Draft, k: 'model' | 'advisorModel', v: string | null, label: 
     return v == null ? `删除 ${label}（原来是 ${old}）` : old ? `把 ${label} 从 ${old} 改为 ${v}` : `设置 ${label} 为 ${v}`;
   });
   d.note('warn', '检测到 cc-switch：它切换供应商时会覆盖 settings.json 里的 model 和 advisorModel。');
+}
+
+function setCompact(d: Draft, v: number | null) {
+  if (v != null && (!Number.isInteger(v) || v < 100000 || v > 1000000)) {
+    d.errors.push(`自动压缩阈值必须是 100000 到 1000000 之间的整数（token 数），现在是 ${v}。`);
+    return;
+  }
+  settingsEdit(d, (o) => {
+    const old = (o.autoCompactWindow as number | undefined) ?? null;
+    if (old === v) return null;
+    if (v == null) delete o.autoCompactWindow;
+    else o.autoCompactWindow = v;
+    if (v != null && o.autoCompactEnabled === false) d.note('warn', '设置文件里 autoCompactEnabled 为 false：自动压缩已经关闭，写入的 autoCompactWindow 不会生效。');
+    return v == null ? `删除 autoCompactWindow（原来是 ${old}）` : `把 autoCompactWindow 从 ${old ?? '未设置'} 改为 ${v}`;
+  });
 }
 
 function setEffort(d: Draft, model: string | null, v: string | null) {
@@ -585,6 +603,7 @@ function presetApply(d: Draft, p: Preset, includeRule: boolean) {
     }
   }
   if (p.advisor.model) setTop(d, 'advisorModel', p.advisor.model, 'advisorModel');
+  if (p.main.autoCompactWindow != null) setCompact(d, p.main.autoCompactWindow);
   for (const a of p.agents) {
     if (BUILTIN_TYPES.includes(a.name)) {
       d.note('info', `${a.name} 是内置类型，内置类型无法通过定义文件修改，已跳过。`);
@@ -675,6 +694,9 @@ export function makePlan(actions: ConfigAction[], envWarnings: PlanNote[]): Chan
         break;
       case 'settings.advisorModel':
         setTop(d, 'advisorModel', a.value, 'advisorModel');
+        break;
+      case 'settings.autoCompactWindow':
+        setCompact(d, a.value);
         break;
       case 'settings.effort':
         setEffort(d, a.model, a.value);

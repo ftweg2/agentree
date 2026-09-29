@@ -1,4 +1,5 @@
 import { useEffect, useRef, useState } from 'react';
+import { shortNumber } from '../lib/format';
 import { EFFORT_LEVELS, MODEL_ALIASES } from '../lib/models';
 import { FAMILY_NAME, useModelOptions } from '../lib/modelOptions';
 
@@ -122,5 +123,73 @@ export function EffortSelect({
         </option>
       )}
     </select>
+  );
+}
+
+/** 自动压缩阈值的常用档位（token 数）。Claude Code 接受 100000 到 1000000 */
+export const COMPACT_PRESETS = [200_000, 500_000, 800_000, 1_000_000];
+
+/**
+ * 自动压缩阈值：几个常用档位加"自定义"。自定义时按千 token（K）输入，存的是 token 数。
+ * 选第一项（emptyLabel）表示 null：不指定，跟 Claude Code 默认
+ */
+export function CompactSelect({
+  value,
+  onChange,
+  emptyLabel = '不指定（跟 Claude Code 默认）',
+  id,
+}: {
+  value: number | null;
+  onChange: (v: number | null) => void;
+  emptyLabel?: string;
+  id?: string;
+}) {
+  const [custom, setCustom] = useState(value !== null && !COMPACT_PRESETS.includes(value));
+  useEffect(() => {
+    if (value !== null && !COMPACT_PRESETS.includes(value)) setCustom(true);
+  }, [value]);
+  const selectValue = custom ? '__custom' : value === null ? '' : String(value);
+  return (
+    <div className="model-input">
+      <select
+        id={id}
+        className="select"
+        value={selectValue}
+        onChange={(e) => {
+          const v = e.target.value;
+          if (v === '__custom') {
+            setCustom(true);
+            if (value === null) onChange(300_000);
+          } else {
+            setCustom(false);
+            onChange(v ? Number(v) : null);
+          }
+        }}
+      >
+        <option value="">{emptyLabel}</option>
+        {COMPACT_PRESETS.map((v) => (
+          <option key={v} value={String(v)}>
+            {shortNumber(v)} token
+          </option>
+        ))}
+        <option value="__custom">自定义…</option>
+      </select>
+      {custom && (
+        <span className="row" style={{ gap: 6 }}>
+          <input
+            className="input mono"
+            type="number"
+            min={100}
+            max={1000}
+            step={10}
+            style={{ width: 96, minWidth: 0, flex: 'none' }}
+            value={value === null ? '' : Math.round(value / 1000)}
+            aria-label="自动压缩阈值，单位千 token"
+            onChange={(e) => onChange(e.target.value === '' ? null : Math.round(Number(e.target.value)) * 1000)}
+          />
+          <span className="small muted">K token（100 到 1000）</span>
+        </span>
+      )}
+    </div>
   );
 }

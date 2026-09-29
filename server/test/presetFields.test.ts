@@ -32,7 +32,7 @@ const appliedFile = path.join(root, 'home', 'applied.json');
 const ctx = (applied: AppliedRecord | null = null) => ({ knownCwds: [], env: [], ccSwitchDetected: false, applied });
 const preset = (over: Record<string, unknown> = {}) => ({
   version: 1,
-  main: { model: null, effort: null },
+  main: { model: null, effort: null, autoCompactWindow: null },
   advisor: { model: null },
   agents: [],
   allowBuiltins: true,
@@ -45,7 +45,7 @@ const changeOf = (p: ReturnType<typeof plan>, name: string) => p.plan.changes.fi
 const record = (wrote: Partial<AppliedRecord['wrote']>): AppliedRecord => ({
   appliedAt: '2026-09-01T00:00:00.000Z',
   includeRule: false,
-  wrote: { model: null, advisorModel: null, effort: null, ...wrote },
+  wrote: { model: null, advisorModel: null, effort: null, autoCompactWindow: null, ...wrote },
 });
 
 beforeEach(() => {
@@ -88,10 +88,11 @@ test('validatePreset：tools 规范化（拆分、去空白、去重），拆完
 });
 
 test('validatePreset：旧预设（没有新字段、带 note）照常能读，version 为 1', () => {
-  const old = { version: 1, main: { model: 'opus', effort: 'high' }, advisor: { model: null }, agents: [{ name: 'x', model: 'sonnet', effort: null, note: '旧的职责' }], allowBuiltins: true, updatedAt: '2026-01-01T00:00:00.000Z' };
+  const old = { version: 1, main: { model: 'opus', effort: 'high', autoCompactWindow: null }, advisor: { model: null }, agents: [{ name: 'x', model: 'sonnet', effort: null, note: '旧的职责' }], allowBuiltins: true, updatedAt: '2026-01-01T00:00:00.000Z' };
   const p = validatePreset(old);
   assert.equal(p.version, 1);
   assert.deepEqual(p.agents[0], { name: 'x', model: 'sonnet', effort: null, note: '旧的职责' });
+  assert.equal(p.main.autoCompactWindow, null, '旧预设没有自动压缩阈值：当作不指定');
 });
 
 test('validatePreset：超长和类型不对时报中文错误', () => {
@@ -202,7 +203,7 @@ test('修改已有文件：prompt 缺失时正文不变；tools 只是顺序不�
 
 const USER_SETTINGS = '{\n  "model": "claude-sonnet-5",\n  "advisorModel": "opus",\n  "effortLevel": "high",\n  "theme": "dark"\n}\n';
 /** 和 USER_SETTINGS 里的值一致的记录（假设这些值都是 agentree 上次写的） */
-const ALL = { model: 'claude-sonnet-5', advisorModel: 'opus', effort: { where: 'top' as const, model: null, value: 'high' } };
+const ALL = { model: 'claude-sonnet-5', advisorModel: 'opus', effort: { where: 'top' as const, model: null, value: 'high' }, autoCompactWindow: null };
 
 test('prune：没有 applied.json 记录时，settings.json 里的键一个都不删', () => {
   fs.writeFileSync(settingsPath, USER_SETTINGS);
@@ -245,7 +246,7 @@ test('prune：值在 agentree 写入之后被改过 -> 不删，给出 info 提�
 test('prune：modelSettings 位置的 effort 只删那个叶子键，modelSettings 里别的内容不动', () => {
   const text = '{\n  "modelSettings": {\n    "claude-opus-5-5": {\n      "effortLevel": "high",\n      "other": 1\n    },\n    "claude-fable-5-1": {\n      "effortLevel": "low"\n    }\n  }\n}\n';
   fs.writeFileSync(settingsPath, text);
-  const p = plan(preset({ main: { model: 'claude-opus-5-5', effort: null } }), { prune: true }, record({ effort: { where: 'modelSettings', model: 'claude-opus-5-5', value: 'high' } }));
+  const p = plan(preset({ main: { model: 'claude-opus-5-5', effort: null, autoCompactWindow: null } }), { prune: true }, record({ effort: { where: 'modelSettings', model: 'claude-opus-5-5', value: 'high' } }));
   const c = changeOf(p, 'settings.json')!;
   // 主模型在方案里指定了，照常追加 model
   assert.equal(c.after, text.replace('"effortLevel": "high",\n      ', '').replace('\n  }\n}\n', '\n  },\n  "model": "claude-opus-5-5"\n}\n'));
@@ -254,7 +255,7 @@ test('prune：modelSettings 位置的 effort 只删那个叶子键，modelSettin
 
 test('prune：effort 换了位置（主模型换成 Opus 5.5）时，旧位置的值没变才删除', () => {
   fs.writeFileSync(settingsPath, '{\n  "effortLevel": "medium"\n}\n');
-  const moved = preset({ main: { model: 'claude-opus-5-5', effort: 'high' } });
+  const moved = preset({ main: { model: 'claude-opus-5-5', effort: 'high', autoCompactWindow: null } });
   const p = plan(moved, { prune: true }, record({ effort: { where: 'top', model: null, value: 'medium' } }));
   const c = changeOf(p, 'settings.json')!;
   const after = JSON.parse(c.after!);
@@ -284,7 +285,7 @@ test('applied.json：旧格式的布尔值当作不知道值（null），prune �
   fs.writeFileSync(appliedFile, JSON.stringify({ appliedAt: '2026-09-01T00:00:00.000Z', includeRule: true, wrote: { model: true, advisorModel: true, effort: { where: 'top', model: null } } }));
   try {
     const rec = readApplied()!;
-    assert.deepEqual(rec, { appliedAt: '2026-09-01T00:00:00.000Z', includeRule: true, wrote: { model: null, advisorModel: null, effort: null } });
+    assert.deepEqual(rec, { appliedAt: '2026-09-01T00:00:00.000Z', includeRule: true, wrote: { model: null, advisorModel: null, effort: null, autoCompactWindow: null } });
     fs.writeFileSync(settingsPath, USER_SETTINGS);
     assert.equal(plan(preset(), { prune: true }, rec).plan.changes.length, 0);
     writeApplied({ appliedAt: 'x', includeRule: false, wrote: ALL });
@@ -313,12 +314,12 @@ test('prune：includeRule 为 false 时删除规则块（不看 applied.json）�
 
 test('applied.json 的 wrote：这次写了记这次的值；null 且 prune 记 null（包括值被改过没删的）；没 prune 保留上次的记录', () => {
   const prev = record(ALL).wrote;
-  const p = validatePreset(preset({ main: { model: null, effort: null }, advisor: { model: null } }));
+  const p = validatePreset(preset({ main: { model: null, effort: null, autoCompactWindow: null }, advisor: { model: null } }));
   assert.deepEqual(nextWrote(p, { ...record({}), wrote: prev }, false), prev, 'prune 为 false：保留');
-  assert.deepEqual(nextWrote(p, { ...record({}), wrote: prev }, true), { model: null, advisorModel: null, effort: null });
-  const q = validatePreset(preset({ main: { model: 'claude-opus-5-5', effort: 'high' }, advisor: { model: 'fable' } }));
-  assert.deepEqual(nextWrote(q, null, false), { model: 'claude-opus-5-5', advisorModel: 'fable', effort: { where: 'modelSettings', model: 'claude-opus-5-5', value: 'high' } });
-  const r = validatePreset(preset({ main: { model: 'opus', effort: 'high' } }));
+  assert.deepEqual(nextWrote(p, { ...record({}), wrote: prev }, true), { model: null, advisorModel: null, effort: null, autoCompactWindow: null });
+  const q = validatePreset(preset({ main: { model: 'claude-opus-5-5', effort: 'high', autoCompactWindow: null }, advisor: { model: 'fable' } }));
+  assert.deepEqual(nextWrote(q, null, false), { model: 'claude-opus-5-5', advisorModel: 'fable', effort: { where: 'modelSettings', model: 'claude-opus-5-5', value: 'high' }, autoCompactWindow: null });
+  const r = validatePreset(preset({ main: { model: 'opus', effort: 'high', autoCompactWindow: null } }));
   assert.deepEqual(nextWrote(r, null, true).effort, { where: 'top', model: null, value: 'high' });
   // 值被改过、这次没删：记录清掉（那个值已经不是 agentree 的）
   fs.writeFileSync(settingsPath, USER_SETTINGS);

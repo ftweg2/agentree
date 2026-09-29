@@ -80,7 +80,7 @@ test('模板预设：settings.json、CLAUDE.md、三个 agent 定义，同一文
 });
 
 test('预设展开：别名主模型的 effort 写顶层并提示；null 不修改；内置类型跳过；max 报错；环境变量和 cc-switch 提示', () => {
-  const base = { version: 1, main: { model: 'opus', effort: 'medium' }, advisor: { model: null }, agents: [{ name: 'Explore', model: 'haiku', effort: null }], allowBuiltins: true, updatedAt: null };
+  const base = { version: 1, main: { model: 'opus', effort: 'medium', autoCompactWindow: null }, advisor: { model: null }, agents: [{ name: 'Explore', model: 'haiku', effort: null }], allowBuiltins: true, updatedAt: null };
   const env = [
     { name: 'CLAUDE_CODE_EFFORT_LEVEL', value: 'high' },
     { name: 'CLAUDE_CODE_SUBAGENT_MODEL_FORCE', value: '1' },
@@ -98,7 +98,7 @@ test('预设展开：别名主模型的 effort 写顶层并提示；null 不修�
   assert.match(msgs, /CLAUDE_CODE_EFFORT_LEVEL/);
   assert.match(msgs, /cc-switch/);
   assert.doesNotMatch(msgs, /DISABLE_ADVISOR_TOOL/, '没设置的变量不提示');
-  const max = makePlan([{ type: 'preset.apply', preset: { ...base, main: { model: 'claude-opus-5-5', effort: 'max' } } as any, includeRule: false }], ctx());
+  const max = makePlan([{ type: 'preset.apply', preset: { ...base, main: { model: 'claude-opus-5-5', effort: 'max', autoCompactWindow: null } } as any, includeRule: false }], ctx());
   assert.equal(max.plan.blocked, true);
   assert.match(max.plan.errors[0], /max/);
 });

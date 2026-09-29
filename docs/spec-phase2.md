@@ -27,7 +27,7 @@
 
 | 文件 | agentree 管什么 | 其余部分 |
 |---|---|---|
-| `settings.json` | `model`、`advisorModel`、`effortLevel`、`modelSettings.<模型>.effortLevel` | 一个字节都不动 |
+| `settings.json` | `model`、`advisorModel`、`effortLevel`、`modelSettings.<模型>.effortLevel`、`autoCompactWindow` | 一个字节都不动 |
 | agent 定义 `.md` | frontmatter 的 `name`、`description`、`model`、`effort`、`tools`；正文（仅当用户编辑了正文） | 其他 frontmatter 字段原样保留，包括顺序和注释 |
 | `CLAUDE.md` | 两个标记之间的规则块 | 标记之外的内容一个字节都不动 |
 
@@ -163,6 +163,10 @@ tools: Read, Grep, Glob
 | 设置了 `CLAUDE_CODE_EFFORT_LEVEL` 环境变量 | warn | 它会覆盖所有 effort 设置，包括 agent 定义文件里的 |
 | 设置了 `CLAUDE_CODE_SUBAGENT_MODEL_FORCE` | warn | 所有子 agent 会被强制使用同一个模型，定义文件里的 model 不生效 |
 | 设置了 `CLAUDE_CODE_DISABLE_ADVISOR_TOOL` | warn | advisor 被禁用，`advisorModel` 设置不生效 |
+| 写了 `autoCompactWindow`，而设置文件里 `autoCompactEnabled` 为 false | warn | 自动压缩已关闭，写入的阈值不会生效 |
+| 写了 `autoCompactWindow`，且设置了 `DISABLE_AUTO_COMPACT` 或 `DISABLE_COMPACT` | warn | 自动压缩（或所有压缩）被关闭，阈值不生效 |
+| 写了 `autoCompactWindow`，且设置了 `CLAUDE_CODE_AUTO_COMPACT_WINDOW` | warn | 环境变量会覆盖 settings 里的阈值（也盖过 `/autocompact` 和 `--autocompact`） |
+| 写了 `autoCompactWindow`，且最近的会话都来自桌面版 | warn | 桌面版是否读取这个设置尚未验证，看生效检查 |
 | 修改了 agent 定义文件 | info | 已经在运行的会话不会受影响，新开的会话才会用新的定义 |
 
 **环境变量只报告，不修改。**
@@ -196,6 +200,7 @@ tools: Read, Grep, Glob
 | `main.model` 不为 null | 写 `settings.json` 的 `model` |
 | `main.effort` 不为 null | `main.model` 是 Opus 5.5 及之后的完整 ID 时写 `modelSettings`；是别名或其他模型时写顶层 `effortLevel` 并给出提示 |
 | `advisor.model` 不为 null | 写 `settings.json` 的 `advisorModel` |
+| `main.autoCompactWindow` 不为 null | 写 `settings.json` 顶层的 `autoCompactWindow`（数字，100000 到 1000000，超出范围计划报错）。项目方案写 `settings.local.json` |
 | `agents` 里的每一项 | 用户级定义文件已存在：只改 `model` 和 `effort`。不存在：用模板新建 |
 | `includeRule` 为 true | 启用 CLAUDE.md 规则 |
 
@@ -237,7 +242,7 @@ tools: Read, Grep, Glob
 | 区域 | 内容 |
 |---|---|
 | 子 agent | 列表显示所有定义文件，分用户级和项目级。可以新建、编辑、改名、删除。编辑界面有描述、模型、effort、工具、正文 |
-| 主会话与 advisor | 当前的主模型、effort、advisor 模型，可以修改 |
+| 主会话与 advisor | 当前的主模型、effort、advisor 模型，可以修改；当前的 `autoCompactWindow` / `autoCompactEnabled` 只显示，在搭建页设置 |
 | CLAUDE.md 规则 | 开关，可以编辑规则文案 |
 | 环境变量 | 检查结果，只读 |
 | 备份 | 备份列表，可以恢复 |
@@ -297,3 +302,16 @@ tools: Read, Grep, Glob
 | 过期的计划 | 失败 |
 | 首写备份 | 第一次修改前生成，之后的修改不会覆盖它 |
 | 恢复备份 | 文件内容和备份逐字节相同 |
+
+## 第二阶段补充：自动压缩阈值
+
+方案的主会话上多一项 `main.autoCompactWindow`（token 数，null 表示不指定），对应 Claude Code 的 `autoCompactWindow` 设置（官方文档 `settings-reference.md`、`env-vars.md`）。和主模型、effort 一样走"搭 → 写 → 验"：
+
+| 步骤 | 做法 |
+|---|---|
+| 写 | 全局方案写用户级 `settings.json`，项目方案写 `<项目>/.claude/settings.local.json`，键是顶层 `autoCompactWindow`（数字）。`prune` 时只删 agentree 自己写过、值没变的键（`applied.json` 的 `wrote.autoCompactWindow`） |
+| 验 | 日志里 `type` 为 `system`、`subtype` 为 `compact_boundary` 的记录是一次压缩；`compactMetadata.trigger` 为 `auto` / `manual`，`compactMetadata.preTokens` 是压缩前的上下文 token 数。没有 `compactMetadata` 也算一次压缩（触发方式 unknown）。压缩后的摘要消息（`isCompactSummary`）不当作首条提示 |
+| 判定 | 起点之后的会话里：有会话在阈值的 105% 以上才自动压缩 -> 不符合（设置被忽略）；有会话在阈值的 50% 到 105% 之间自动压缩 -> 已生效；否则还没有会话达到阈值，继续等 |
+| 只用一次 | 启动命令加 `--autocompact <token 数>` |
+
+桌面版是否读取 `autoCompactWindow` 尚未验证：写入按有效处理，由生效检查揭示真相。

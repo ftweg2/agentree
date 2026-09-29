@@ -220,6 +220,9 @@ const NodeCard = memo(function NodeCard(p: NodeCardProps) {
             {node.models.length > 1 && ` +${node.models.length - 1}`}
           </span>
           {efforts && <span title={`effort：${efforts}`}>{efforts}</span>}
+          {node.kind === 'main' && node.compactions.total > 0 && (
+            <span title={`主对话被压缩了 ${node.compactions.total} 次：自动 ${node.compactions.auto} 次，手动 ${node.compactions.manual} 次`}>压缩 {node.compactions.total}</span>
+          )}
           <span className="spacer" />
           <Flash value={u.requests}>
             <b title={`${scope}请求次数`}>{fullNumber(u.requests)}</b>次

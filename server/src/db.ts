@@ -5,7 +5,7 @@ import path from 'node:path';
 import { agentreeHome } from './config.ts';
 import type { LineBatch } from './parser.ts';
 
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS files (
@@ -132,6 +132,18 @@ CREATE TABLE IF NOT EXISTS agent_listings (
   removed_at TEXT,
   PRIMARY KEY (session_id, agent_type)
 );
+
+-- 上下文压缩（日志里的 compact_boundary 记录）。agent 是发生压缩的对话：'main' 或子 agent id；
+-- trigger 为 auto / manual / unknown，pre_tokens 是压缩前的上下文 token 数（不知道为 NULL）
+CREATE TABLE IF NOT EXISTS compactions (
+  session_id TEXT NOT NULL,
+  agent TEXT NOT NULL,
+  key TEXT NOT NULL,
+  trigger TEXT NOT NULL DEFAULT 'unknown',
+  pre_tokens INTEGER,
+  ts TEXT,
+  PRIMARY KEY (session_id, agent, key)
+);
 `;
 
 export interface FileRow {
@@ -190,14 +202,14 @@ export class Store {
       this.db.exec(`UPDATE sessions SET cwd = NULL
           WHERE session_id IN (SELECT session_id FROM files WHERE present = 1 AND agent = 'main');
         UPDATE files SET offset = 0, size = -1, mtime_ms = -1, fingerprint = '' WHERE present = 1;`);
-      // （这里的重读同时补上 v4 的 agent_listings）
-    } else if (ver === 3) {
-      // v3 -> v4：新增 agent_listings。日志还在的文件重置读取进度，从头重读一遍补上这张表；
+      // （这里的重读同时补上 v4 的 agent_listings 和 v5 的 compactions）
+    } else if (ver === 3 || ver === 4) {
+      // v3 -> v4：新增 agent_listings；v4 -> v5：新增 compactions。日志还在的文件重置读取进度，从头重读一遍补上这些表；
       // 已入库的数据不删（去重键保证重读不会重复计数），日志已经被清理的文件（present = 0）不动，它们的统计原样保留
       this.db.exec(`UPDATE files SET offset = 0, size = -1, mtime_ms = -1, fingerprint = '' WHERE present = 1;`);
     } else if (ver !== 0 && ver !== SCHEMA_VERSION) {
       // 不认识的版本：重建
-      for (const t of ['files', 'sessions', 'requests', 'advisor_usage', 'tool_uses', 'agent_results', 'notifications', 'agent_meta', 'agent_listings']) {
+      for (const t of ['files', 'sessions', 'requests', 'advisor_usage', 'tool_uses', 'agent_results', 'notifications', 'agent_meta', 'agent_listings', 'compactions']) {
         this.db.exec(`DROP TABLE IF EXISTS ${t}`);
       }
     }
@@ -300,6 +312,15 @@ export class Store {
          first_added_at = CASE WHEN agent_listings.first_added_at IS NULL OR (excluded.first_added_at IS NOT NULL AND excluded.first_added_at < agent_listings.first_added_at) THEN excluded.first_added_at ELSE agent_listings.first_added_at END,
          last_added_at = CASE WHEN agent_listings.last_added_at IS NULL OR (excluded.last_added_at IS NOT NULL AND excluded.last_added_at > agent_listings.last_added_at) THEN excluded.last_added_at ELSE agent_listings.last_added_at END,
          removed_at = CASE WHEN agent_listings.removed_at IS NOT NULL AND excluded.last_added_at IS NOT NULL AND excluded.last_added_at > agent_listings.removed_at THEN NULL ELSE agent_listings.removed_at END`,
+    );
+    // 压缩：重读同一条记录时，已知的触发方式和 token 数不被 unknown / NULL 覆盖
+    p(
+      'upsertCompaction',
+      `INSERT INTO compactions (session_id, agent, key, trigger, pre_tokens, ts) VALUES (@session_id, @agent, @key, @trigger, @pre_tokens, @ts)
+       ON CONFLICT(session_id, agent, key) DO UPDATE SET
+         trigger = CASE WHEN compactions.trigger = 'unknown' THEN excluded.trigger ELSE compactions.trigger END,
+         pre_tokens = COALESCE(compactions.pre_tokens, excluded.pre_tokens),
+         ts = COALESCE(compactions.ts, excluded.ts)`,
     );
     // 移除：只记在加入之后的移除；没加入过的类型不记
     p(
@@ -442,6 +463,9 @@ export class Store {
       for (const l of batch.listings) {
         for (const t of l.added) this.st.listingAdd.run({ session_id: sid, agent_type: t, ts: l.ts });
         for (const t of l.removed) this.st.listingRemove.run({ session_id: sid, agent_type: t, ts: l.ts });
+      }
+      for (const c of batch.compactions) {
+        this.st.upsertCompaction.run({ session_id: sid, agent, key: c.key, trigger: c.trigger, pre_tokens: c.preTokens, ts: c.ts });
       }
       this.st.upsertFile.run({ ...file });
       this.db.exec('COMMIT');

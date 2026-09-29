@@ -5,7 +5,7 @@ import { existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import type { AgentDefinition, CheckLevel, ClaudeConfigSnapshot, EnvCheck, Preset, PresetAgent } from '../../shared/types.ts';
-import { BUILTIN_AGENT_TYPES, claudeConfigDirs } from './config.ts';
+import { BUILTIN_AGENT_TYPES, claudeConfigDirs, isValidAutoCompactWindow } from './config.ts';
 import { parseAgentDoc, type AgentDoc } from './config/frontmatter.ts';
 import { readTextFile } from './config/text.ts';
 
@@ -121,6 +121,11 @@ function strOrNull(v: unknown): string | null {
   return typeof v === 'string' && v.trim() ? v.trim() : null;
 }
 
+/** settings 里的 autoCompactWindow：只认有限的数字，其他写法（如 "500k"）为 null */
+function numOrNull(v: unknown): number | null {
+  return typeof v === 'number' && Number.isFinite(v) ? v : null;
+}
+
 // ---------------- 环境变量 ----------------
 
 const ENV_VARS: Array<{ name: string; impact: string; setLevel: CheckLevel }> = [
@@ -128,6 +133,10 @@ const ENV_VARS: Array<{ name: string; impact: string; setLevel: CheckLevel }> = 
   { name: 'CLAUDE_CODE_SUBAGENT_MODEL', impact: '子 agent 没有指定模型时使用的默认模型', setLevel: 'info' },
   { name: 'CLAUDE_CODE_SUBAGENT_MODEL_FORCE', impact: '强制所有子 agent 使用同一个模型，配置文件里的 model 不再生效', setLevel: 'warn' },
   { name: 'CLAUDE_CODE_DISABLE_ADVISOR_TOOL', impact: '禁用 advisor，配置了 advisor 也不会被调用', setLevel: 'warn' },
+  { name: 'CLAUDE_CODE_AUTO_COMPACT_WINDOW', impact: '覆盖 settings.json 里的 autoCompactWindow（也盖过 /autocompact 和 --autocompact），只接受纯数字的 token 数', setLevel: 'warn' },
+  { name: 'DISABLE_AUTO_COMPACT', impact: '关闭自动压缩，autoCompactWindow 设置不生效', setLevel: 'warn' },
+  { name: 'DISABLE_COMPACT', impact: '关闭所有压缩（包括手动的 /compact），autoCompactWindow 设置不生效', setLevel: 'warn' },
+  { name: 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE', impact: '把自动压缩的触发点降到阈值的这个百分比（1 到 100），会比 autoCompactWindow 更早压缩', setLevel: 'info' },
   { name: 'DISABLE_TELEMETRY', impact: '会导致功能开关无法拉取，advisor 可能不可用', setLevel: 'warn' },
   { name: 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', impact: '会导致功能开关无法拉取，advisor 可能不可用', setLevel: 'warn' },
   { name: 'CLAUDE_CONFIG_DIR', impact: '改变了 Claude Code 配置目录的位置', setLevel: 'info' },
@@ -219,6 +228,8 @@ export async function configSnapshot(projectCwds: string[]): Promise<ClaudeConfi
       model: strOrNull(settings.model),
       advisorModel: strOrNull(settings.advisorModel),
       modelEffort,
+      autoCompactWindow: numOrNull(settings.autoCompactWindow),
+      autoCompactEnabled: typeof settings.autoCompactEnabled === 'boolean' ? settings.autoCompactEnabled : null,
     },
     env: checks,
     builtinAgentTypes: [...BUILTIN_AGENT_TYPES],
@@ -260,9 +271,11 @@ export function presetFromConfig(snap: ClaudeConfigSnapshot, fallback: PresetFal
   let mainEffort = validEffort(snap.settings.effortLevel);
   if (mainModel && snap.settings.modelEffort[mainModel]) mainEffort = validEffort(snap.settings.modelEffort[mainModel]) ?? mainEffort;
   if (!mainEffort) mainEffort = validEffort(fallback?.effort);
+  // 自动压缩阈值：settings 里的值不在 Claude Code 接受的范围内时当作没设置
+  const w = snap.settings.autoCompactWindow;
   return {
     version: 1,
-    main: { model: mainModel, effort: mainEffort },
+    main: { model: mainModel, effort: mainEffort, autoCompactWindow: isValidAutoCompactWindow(w) ? w : null },
     advisor: { model: snap.settings.advisorModel ?? fallback?.advisorModel ?? null },
     agents: presetAgentsFrom(snap.definitions.filter((x) => x.source === 'user')),
     allowBuiltins: true,
@@ -281,9 +294,10 @@ export async function presetFromProject(projectCwd: string): Promise<Preset> {
   const modelEffort = modelEffortOf(settings);
   const mainEffort = (mainModel ? validEffort(modelEffort[mainModel]) : null) ?? validEffort(settings.effortLevel);
   const defs = await readDefinitions(path.join(projectCwd, '.claude', 'agents'), 'project', projectCwd);
+  const w = settings.autoCompactWindow;
   return {
     version: 1,
-    main: { model: mainModel, effort: mainEffort },
+    main: { model: mainModel, effort: mainEffort, autoCompactWindow: isValidAutoCompactWindow(w) ? w : null },
     advisor: { model: strOrNull(settings.advisorModel) },
     agents: presetAgentsFrom(defs),
     allowBuiltins: true,

@@ -58,7 +58,7 @@ const q = (cwd: string) => `cwd=${encodeURIComponent(cwd)}`;
 
 const preset = (over: Partial<Preset> = {}): Preset => ({
   version: 1,
-  main: { model: null, effort: null },
+  main: { model: null, effort: null, autoCompactWindow: null },
   advisor: { model: null },
   agents: [],
   allowBuiltins: true,
@@ -109,10 +109,11 @@ await indexer.fullScan();
 // ---------------- 叠加与归属（纯函数） ----------------
 
 test('叠加：子 agent 取并集、同名用项目的；主模型 / effort / advisor 为 null 时用全局的；allowBuiltins 用项目的', () => {
-  const g = preset({ main: { model: 'claude-opus-5-5', effort: 'high' }, advisor: { model: 'fable' }, agents: [agent('reviewer', 'sonnet'), agent('explorer', 'opus')], allowBuiltins: true });
-  const p = preset({ main: { model: null, effort: 'low' }, advisor: { model: null }, agents: [agent('Reviewer', 'haiku'), agent('writer', null)], allowBuiltins: false, updatedAt: 'x' });
+  const g = preset({ main: { model: 'claude-opus-5-5', effort: 'high', autoCompactWindow: 500000 }, advisor: { model: 'fable' }, agents: [agent('reviewer', 'sonnet'), agent('explorer', 'opus')], allowBuiltins: true });
+  const p = preset({ main: { model: null, effort: 'low', autoCompactWindow: null }, advisor: { model: null }, agents: [agent('Reviewer', 'haiku'), agent('writer', null)], allowBuiltins: false, updatedAt: 'x' });
   const o = overlayPreset(g, p);
-  assert.deepEqual(o.main, { model: 'claude-opus-5-5', effort: 'low' });
+  assert.deepEqual(o.main, { model: 'claude-opus-5-5', effort: 'low', autoCompactWindow: 500000 }, '自动压缩阈值项目没指定时用全局的');
+  assert.equal(overlayPreset(g, preset({ main: { model: null, effort: null, autoCompactWindow: 200000 } })).main.autoCompactWindow, 200000, '项目指定了就用项目的');
   assert.deepEqual(o.advisor, { model: 'fable' });
   assert.deepEqual(o.agents.map((a) => [a.name, a.model]), [['Reviewer', 'haiku'], ['writer', null], ['explorer', 'opus']], '同名（不区分大小写）用项目的');
   assert.equal(o.allowBuiltins, false);
@@ -159,7 +160,7 @@ test('项目方案的存、取、删、列举；文件名稳定；坏文件被�
   assert.equal(onDisk.projectCwd, cwd);
   assert.equal(onDisk.applied, null);
   // 应用记录存在项目方案文件里
-  const rec: AppliedRecord = { appliedAt: '2026-09-01T00:00:00.000Z', includeRule: true, wrote: { model: 'x', advisorModel: null, effort: null } };
+  const rec: AppliedRecord = { appliedAt: '2026-09-01T00:00:00.000Z', includeRule: true, wrote: { model: 'x', advisorModel: null, effort: null, autoCompactWindow: null } };
   s.setApplied(rec, cwd);
   assert.deepEqual(new PresetStore().getApplied(cwd), rec, '新实例从磁盘读回');
   assert.equal(readApplied(), null, '全局 applied.json 没写');
@@ -231,7 +232,7 @@ const ctxFor = (known: string[], opts: { applied?: AppliedRecord | null; project
   projectApplied: opts.projectApplied,
 });
 const PROJECT_SCHEME = preset({
-  main: { model: 'claude-opus-5-5', effort: 'high' },
+  main: { model: 'claude-opus-5-5', effort: 'high', autoCompactWindow: null },
   advisor: { model: 'fable' },
   agents: [{ ...agent('reviewer', 'haiku'), description: '改完之后审查', prompt: '你是审查员。\n' }],
 });
@@ -281,7 +282,7 @@ test('项目范围：新建 settings.local.json 时提示加进 .gitignore；项
 test('项目范围：prune 用项目自己的应用记录；未知项目目录 blocked；不带 projectCwd 时和原来一样写用户级', () => {
   const local = path.join(projP, '.claude', 'settings.local.json');
   const noMain = preset({ agents: PROJECT_SCHEME.agents });
-  const rec = (model: string): AppliedRecord => ({ appliedAt: 'x', includeRule: false, wrote: { model, advisorModel: 'fable', effort: null } });
+  const rec = (model: string): AppliedRecord => ({ appliedAt: 'x', includeRule: false, wrote: { model, advisorModel: 'fable', effort: null, autoCompactWindow: null } });
   // 项目记录里写过 claude-opus-5-5 -> 删除；全局记录不参与
   const p = makePlan([{ type: 'preset.apply', preset: noMain, projectCwd: projP, includeRule: true, prune: true }], ctxFor([projP], { applied: null, projectApplied: () => rec('claude-opus-5-5') }));
   const c = p.plan.changes.find((x) => x.filePath.endsWith('settings.local.json'))!;
@@ -299,7 +300,7 @@ test('项目范围：prune 用项目自己的应用记录；未知项目目录 b
   assert.equal(rel.plan.blocked, true);
   // 不带 projectCwd：写用户级
   for (const projectCwd of [undefined, null]) {
-    const n = makePlan([{ type: 'preset.apply', preset: preset({ main: { model: 'opus', effort: null } }), projectCwd, includeRule: false }], ctxFor([projP]));
+    const n = makePlan([{ type: 'preset.apply', preset: preset({ main: { model: 'opus', effort: null, autoCompactWindow: null } }), projectCwd, includeRule: false }], ctxFor([projP]));
     assert.deepEqual(n.plan.changes.map((x) => path.basename(x.filePath)), ['settings.json']);
     assert.equal(n.presetApply?.projectCwd, null);
   }
@@ -342,7 +343,7 @@ test('接口：from-config?cwd 只读这个项目自己的配置；/api/config/r
   const r = await call('POST', `/api/preset/from-config?${q(projB)}`, {});
   assert.equal(r.status, 200, JSON.stringify(r.body));
   assert.deepEqual(r.body.agents.map((a: any) => [a.name, a.model]), [['pb', 'haiku']], '不含全局的 helper');
-  assert.deepEqual([r.body.main, r.body.advisor], [{ model: 'claude-opus-5-5', effort: 'xhigh' }, { model: 'fable' }]);
+  assert.deepEqual([r.body.main, r.body.advisor], [{ model: 'claude-opus-5-5', effort: 'xhigh', autoCompactWindow: null }, { model: 'fable' }]);
   assert.equal((await call('POST', `/api/preset/from-config?${q(path.join(root, 'unknown'))}`, {})).status, 400);
   fs.rmSync(path.join(projB, '.claude'), { recursive: true });
 
@@ -355,7 +356,7 @@ test('接口：from-config?cwd 只读这个项目自己的配置；/api/config/r
 });
 
 // projA 的项目方案：reviewer 用 haiku，主模型不指定（用全局的）
-const SCHEME_A = preset({ main: { model: null, effort: null }, agents: [{ ...agent('reviewer', 'haiku'), description: '项目 A 的审查员', prompt: '项目 A。\n' }] });
+const SCHEME_A = preset({ main: { model: null, effort: null, autoCompactWindow: null }, agents: [{ ...agent('reviewer', 'haiku'), description: '项目 A 的审查员', prompt: '项目 A。\n' }] });
 
 test('接口：应用项目方案后保存的是项目方案和项目的应用记录，全局方案和全局 applied.json 不变；之后立刻检查全部一致', async () => {
   const globalBefore = (await call('GET', '/api/preset', undefined, H)).body;
@@ -388,7 +389,7 @@ test('接口：应用项目方案后保存的是项目方案和项目的应用�
 // ---------------- 一致性检查 ----------------
 
 test('一致性检查：项目目录（含子目录）下的会话按叠加方案比，别的目录按全局方案比；嵌套项目取最长匹配', async () => {
-  presets.save(preset({ main: { model: 'claude-opus-5-5', effort: null }, agents: [agent('reviewer', 'sonnet')] }));
+  presets.save(preset({ main: { model: 'claude-opus-5-5', effort: null, autoCompactWindow: null }, agents: [agent('reviewer', 'sonnet')] }));
   presets.save(preset({ agents: [agent('reviewer', 'sonnet')] }), projInner);
   const byId = new Map(analyzer.sessions().map((s) => [s.id, s]));
   assert.deepEqual(byId.get('sA')!.scheme, { scope: 'project', projectCwd: projA });
@@ -436,7 +437,7 @@ test('生效检查：项目范围只统计这个项目的会话（不含被更�
   assert.equal(grv.observed.lastSessionId, 'sB');
   assert.equal(gr.items.find((i) => i.key === 'main.model')!.observed.count, 4);
   // inner 的方案指定了主模型：sInner 不计入全局的主模型
-  presets.save(preset({ main: { model: 'claude-opus-5-5', effort: null }, agents: [agent('reviewer', 'sonnet')] }), projInner);
+  presets.save(preset({ main: { model: 'claude-opus-5-5', effort: null, autoCompactWindow: null }, agents: [agent('reviewer', 'sonnet')] }), projInner);
   const projects2 = presets.listProjects().map((p) => ({ projectCwd: p.projectCwd, preset: p.preset }));
   const gr2 = effectReport({ preset: { ...g, updatedAt: null }, includeRule: false }, { store, analyzer, ctx, projects: projects2 });
   assert.equal(gr2.items.find((i) => i.key === 'main.model')!.observed.count, 3);

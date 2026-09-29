@@ -3,6 +3,7 @@ import type {
   AgentNode,
   AgentStatus,
   AgentTypeUsage,
+  CompactionStats,
   ConformanceCheck,
   ConformanceVerdict,
   DailyPoint,
@@ -59,6 +60,10 @@ function tsMs(ts: string | null): number | null {
 
 function iso(ms: number | null): string | null {
   return ms === null ? null : new Date(ms).toISOString();
+}
+
+export function emptyCompactions(): CompactionStats {
+  return { total: 0, auto: 0, manual: 0, autoPreTokens: [] };
 }
 
 export class Analyzer {
@@ -169,6 +174,20 @@ export class Analyzer {
       .prepare(`SELECT task_id, status, MAX(ts) AS ts FROM notifications WHERE session_id = ? GROUP BY task_id, status`)
       .all(sid) as Array<{ task_id: string; status: string; ts: string | null }>;
     const metaRows = db.prepare(`SELECT * FROM agent_meta WHERE session_id = ?`).all(sid) as any[];
+    // 上下文压缩：按 agent 分开统计，自动压缩的 preTokens 按时间顺序
+    const compactRows = db
+      .prepare(`SELECT agent, trigger, pre_tokens FROM compactions WHERE session_id = ? ORDER BY ts IS NULL, ts, key`)
+      .all(sid) as Array<{ agent: string; trigger: string; pre_tokens: number | null }>;
+    const compactions = new Map<string, CompactionStats>();
+    for (const r of compactRows) {
+      const c = compactions.get(r.agent) ?? emptyCompactions();
+      c.total++;
+      if (r.trigger === 'auto') {
+        c.auto++;
+        if (r.pre_tokens !== null) c.autoPreTokens.push(r.pre_tokens);
+      } else if (r.trigger === 'manual') c.manual++;
+      compactions.set(r.agent, c);
+    }
 
     // ---------- 建树输入 ----------
     const toolUses = new Map<string, ToolUseLoc>();
@@ -334,6 +353,7 @@ export class Analyzer {
         requestedModel: null,
         advisorModel: advModel.get('main') ?? null,
         advisorCalls: advisorCalls.get('main') ?? 0,
+        compactions: compactions.get('main') ?? emptyCompactions(),
         conformance: { verdict: 'not-checked', presetAgent: null, checks: [] },
         children: [],
       });
@@ -403,6 +423,7 @@ export class Analyzer {
         requestedModel: tu?.model ?? meta?.model ?? null,
         advisorModel: advModel.get(id) ?? null,
         advisorCalls: advisorCalls.get(id) ?? 0,
+        compactions: compactions.get(id) ?? emptyCompactions(),
         conformance: { verdict: 'not-checked', presetAgent: null, checks: [] },
         children: [],
       });
@@ -571,6 +592,7 @@ export class Analyzer {
       mainEffort: extras.get('main')?.lastEffort ?? main.efforts[main.efforts.length - 1] ?? null,
       advisorModel: main.advisorModel,
       advisorCalls: totalAdvisorCalls,
+      compactions: main.compactions,
       agentCount: ordered.length - 1,
       maxDepth,
       requests: ordered.reduce((s, n) => s + n.requests, 0),

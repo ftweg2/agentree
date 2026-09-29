@@ -55,6 +55,19 @@ export interface Conformance {
   checks: ConformanceCheck[];
 }
 
+/**
+ * 上下文压缩的统计。依据是日志里 type 为 system、subtype 为 compact_boundary 的记录：
+ * compactMetadata.trigger 为 auto（上下文达到阈值时自动压缩）或 manual（用户输入 /compact），
+ * compactMetadata.preTokens 是压缩前的上下文 token 数。记录上没有 compactMetadata 时仍算一次压缩，但不知道触发方式和 token 数
+ */
+export interface CompactionStats {
+  total: number;
+  auto: number;
+  manual: number;
+  /** 自动压缩时的 preTokens，按时间顺序；记录上没有 preTokens 的不在这里 */
+  autoPreTokens: number[];
+}
+
 export interface AgentNode {
   /** 主会话固定为 'main'，子 agent 为 agentId */
   id: string;
@@ -102,6 +115,8 @@ export interface AgentNode {
   advisorModel: string | null;
   /** advisor 实际被调用的次数 */
   advisorCalls: number;
+  /** 这个 agent 自己的对话被压缩的次数（主会话是主对话，子 agent 是它自己的对话），不含后代 */
+  compactions: CompactionStats;
   conformance: Conformance;
   /** 子节点 id，按开始时间排序 */
   children: string[];
@@ -138,6 +153,8 @@ export interface SessionSummary {
   mainEffort: string | null;
   advisorModel: string | null;
   advisorCalls: number;
+  /** 主对话被压缩的次数（不含子 agent 自己的对话；每个 agent 自己的见 AgentNode.compactions） */
+  compactions: CompactionStats;
   /** 子 agent 数量，不含主会话 */
   agentCount: number;
   maxDepth: number;
@@ -302,7 +319,7 @@ export interface PresetAgent {
  *
  * 一个项目里实际生效的是两者叠加：
  *   子 agent   全局的和项目的都可用；同名时用项目的
- *   主模型、主 effort、advisor   项目方案里指定了就用项目的，没指定（null）就用全局的
+ *   主模型、主 effort、advisor、自动压缩阈值   项目方案里指定了就用项目的，没指定（null）就用全局的
  *   规则       两边的 CLAUDE.md 都会被读到
  *   allowBuiltins   有项目方案时用项目方案的
  * 一致性检查和生效检查都按叠加后的结果来比。
@@ -325,7 +342,16 @@ export interface SchemeInfo {
 /** 用户期望的 agent 树，存在 agentree 自己的目录里，不写入 Claude Code 配置 */
 export interface Preset {
   version: 1;
-  main: { model: string | null; effort: string | null };
+  main: {
+    model: string | null;
+    effort: string | null;
+    /**
+     * 自动压缩阈值：上下文达到这么多 token 时 Claude Code 自动压缩对话，对应 settings 的 autoCompactWindow。
+     * 取值 100000 到 1000000 的整数，实际生效的上限是模型的上下文窗口（200K 的模型到 200K 就压缩）。
+     * null 表示不指定，跟 Claude Code 默认。磁盘上的旧方案没有这个字段，读入时当作 null
+     */
+    autoCompactWindow: number | null;
+  };
   advisor: { model: string | null };
   agents: PresetAgent[];
   /** 为 true 时，内置类型（Explore、Plan 等）不算 unplanned */
@@ -364,6 +390,10 @@ export interface ClaudeConfigSnapshot {
     advisorModel: string | null;
     /** modelSettings.<model>.effortLevel 的映射 */
     modelEffort: Record<string, string>;
+    /** 自动压缩阈值（token 数）；没有设置或不是数字为 null */
+    autoCompactWindow: number | null;
+    /** 是否开启自动压缩；没有设置为 null（Claude Code 默认开启） */
+    autoCompactEnabled: boolean | null;
   };
   env: EnvCheck[];
   builtinAgentTypes: string[];
@@ -454,6 +484,11 @@ export type ConfigAction =
   | { type: 'settings.mainModel'; value: string | null }
   | { type: 'settings.advisorModel'; value: string | null }
   | {
+      type: 'settings.autoCompactWindow';
+      /** token 数，100000 到 1000000 的整数；null 表示删除这个键，跟 Claude Code 默认 */
+      value: number | null;
+    }
+  | {
       type: 'settings.effort';
       /** 要设置 effort 的模型完整 ID；null 表示写全局默认的 effortLevel */
       model: string | null;
@@ -476,7 +511,7 @@ export type ConfigAction =
       ruleText?: string | null;
       /**
        * 为 true 时，把 agentree 以前写进去、现在方案里已经没有的东西移除：
-       *   主模型、主 effort、advisor：只有 agentree 上次应用时写过这个键，且这次预设里为 null，才删除。
+       *   主模型、主 effort、advisor、自动压缩阈值：只有 agentree 上次应用时写过这个键，且这次预设里为 null，才删除。
        *     不是 agentree 写的键（用户自己写的、cc-switch 写的）永远不删
        *   includeRule 为 false，而 CLAUDE.md 里有 agentree 的规则块 -> 删除规则块
        * 不会删除任何 agent 定义文件（删除定义文件只能用 agent.delete）。
@@ -580,7 +615,7 @@ export interface ClaudeMdRuleState {
  * 生效检查：回答"搭好的方案写进去了吗、实际运行时用上了吗"。
  * 每一项分两步判断：written（配置文件里是不是这个值）和 observed（之后的实际运行里是不是这个值）。
  */
-export type EffectKind = 'main-model' | 'main-effort' | 'advisor' | 'rule' | 'agent';
+export type EffectKind = 'main-model' | 'main-effort' | 'main-compact' | 'advisor' | 'rule' | 'agent';
 
 export interface EffectWritten {
   /**
@@ -621,17 +656,17 @@ export interface EffectObserved {
   /**
    * match     之后的运行里出现过，且符合方案
    * mismatch  之后的运行里出现过，但不符合方案
-   * not-seen  之后还没有出现过（还没新开会话，或主会话没派发过这个 agent）
+   * not-seen  之后还没有出现过（还没新开会话，或主会话没派发过这个 agent；自动压缩阈值是还没有会话的上下文达到过阈值）
    * n/a       无法从日志判断（如 CLAUDE.md 规则是否被读到）
    */
   state: 'match' | 'mismatch' | 'not-seen' | 'n/a';
   /** 统计的起点：上次应用的时间，没应用过则是预设保存的时间；都没有为 null（统计全部历史） */
   since: string | null;
-  /** 起点之后出现的次数：主会话类的项是会话数，agent 是被派发的次数，advisor 是被调用的次数 */
+  /** 起点之后出现的次数：主会话类的项是会话数，agent 是被派发的次数，advisor 是被调用的次数，自动压缩阈值是自动压缩过的会话数 */
   count: number;
   /** 其中符合方案的次数 */
   matched: number;
-  /** 实际出现过的值（模型名、effort 值），按出现次数从多到少 */
+  /** 实际出现过的值（模型名、effort 值、自动压缩前的 token 数），按出现次数从多到少 */
   actual: string[];
   lastSeenAt: string | null;
   /** 最近一次出现所在的会话，前端用来跳转 */
@@ -639,7 +674,7 @@ export interface EffectObserved {
 }
 
 export interface EffectItem {
-  /** 'main.model'、'main.effort'、'advisor'、'rule'、'agent:<name>' */
+  /** 'main.model'、'main.effort'、'main.compact'、'advisor'、'rule'、'agent:<name>' */
   key: string;
   kind: EffectKind;
   /** agent 的名字；其他为 null */

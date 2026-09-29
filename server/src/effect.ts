@@ -17,7 +17,7 @@ import type {
   SessionDetail,
 } from '../../shared/types.ts';
 import type { Analyzer } from './aggregate.ts';
-import { BUILTIN_AGENT_TYPES, claudeConfigDirs } from './config.ts';
+import { BUILTIN_AGENT_TYPES, claudeConfigDirs, formatWindow } from './config.ts';
 import { checkEffort, checkModel, matchModel, normalizeDir, normalizeModel, owningProject } from './conformance.ts';
 import type { Store } from './db.ts';
 import { enableRule, findRuleBlock, RuleBlockError } from './config/claudeMd.ts';
@@ -66,6 +66,14 @@ export function effectText(hasSince: boolean) {
     advisorNotCalled: `已写入。${after}的会话已配置了 advisor，但还没有被调用过。`,
     advisorMismatch: (actual: string, x: string) => `已写入，但${after}会话记录上的 advisor 是 ${actual}，不是 ${x}。`,
     advisorMissing: `已写入，但${after}的会话记录上没有 advisor。`,
+    // 自动压缩阈值：看之后的会话在多少 token 时自动压缩
+    compactMatch: (count: number, x: string) => `已写入。${after}有 ${count} 个会话在阈值附近自动压缩过（压缩前 ${x} token），设置已生效。`,
+    compactMismatch: (actual: string, x: string) => `已写入，但${after}有会话到 ${actual} token 才自动压缩，超过了阈值 ${x}，设置没有生效。`,
+    compactBelow: (actual: string, x: string) =>
+      `已写入。${after}有会话自动压缩过，但压缩前只有 ${actual} token，还没到阈值 ${x}：可能是模型本身的上下文更小（阈值最高只能到模型的上下文上限），也可能设置了 CLAUDE_AUTOCOMPACT_PCT_OVERRIDE。`,
+    compactNotReached: `已写入。${after}还没有会话的上下文达到过阈值，暂时看不出有没有生效。`,
+    compactWait: (x: string) => `继续正常使用。等某个会话的上下文超过 ${x} token 之后，这里会显示它是不是在阈值附近压缩的。`,
+    compactDesktopUnverified: '已写入配置文件。桌面版是否读取这个设置还没有验证。',
     ruleAdvisorCalls: (n: number) => `${after} advisor 被调用了 ${n} 次。`,
     agentLoadedUnknown: '已写入。新开一个会话后，这里会显示它有没有被加载。',
     agentNotLoaded: `已写入，但${after}的会话都没有加载它。`,
@@ -249,11 +257,11 @@ class Sessions {
     return this.rows.some((r) => r.sid === sid);
   }
 
-  /** 全局方案时：这个会话所属的项目方案是否接管了主模型 / 主 effort / advisor 这一项 */
-  takenOverMain(sid: string, item: 'model' | 'effort' | 'advisor'): boolean {
+  /** 全局方案时：这个会话所属的项目方案是否接管了主模型 / 主 effort / advisor / 自动压缩阈值这一项 */
+  takenOverMain(sid: string, item: 'model' | 'effort' | 'advisor' | 'compact'): boolean {
     const p = this.owners.get(sid);
     if (!p) return false;
-    return (item === 'model' ? p.main.model : item === 'effort' ? p.main.effort : p.advisor.model) !== null;
+    return (item === 'model' ? p.main.model : item === 'effort' ? p.main.effort : item === 'compact' ? p.main.autoCompactWindow : p.advisor.model) !== null;
   }
 
   /** 全局方案时：这个会话所属的项目方案里有没有同名 agent（有则那次派发用的是项目的定义） */
@@ -356,14 +364,14 @@ export function effectReport(input: EffectInput, deps: EffectDeps): EffectReport
   // prune 时的判断（和 planner 用同一个函数）：remove 会被移除；changed 是 agentree 写过、但之后被改过的，不会动
   const decisions = settings ? pruneDecisions(preset, applied, node) : [];
 
-  /** settings.json 里一个键的写入状态。和 planner 的判断一致：值相同（字符串）才算不需要改 */
-  const settingsWritten = (expected: string | null, p: string[], decision: PruneDecision | undefined): EffectWritten & { owned: boolean } => {
+  /** settings.json 里一个键的写入状态。和 planner 的判断一致：值相同（类型也相同）才算不需要改 */
+  const settingsWritten = (expected: string | number | null, p: string[], decision: PruneDecision | undefined): EffectWritten & { owned: boolean } => {
     const base = { filePath: settingsPath, diffs: [] as string[] };
     if (settingsError) return { ...base, state: expected !== null ? 'differs' : 'n/a', actual: null, owned: false };
     if (expected !== null) {
       const n = node(p);
       if (!n) return { ...base, state: 'no', actual: null, owned: false };
-      return { ...base, state: n.type === 'string' && n.value === expected ? 'yes' : 'differs', actual: shortValue(p), owned: false };
+      return { ...base, state: (n.type === 'string' || n.type === 'number') && n.value === expected ? 'yes' : 'differs', actual: shortValue(p), owned: false };
     }
     if (decision?.status === 'remove') return { ...base, state: 'extra', actual: decision.current, owned: true };
     // 值被改过：已经不是 agentree 的，不会动
@@ -430,6 +438,27 @@ export function effectReport(input: EffectInput, deps: EffectDeps): EffectReport
     items.push(item);
   }
 
+  // ---------- 自动压缩阈值 ----------
+  {
+    const expected = preset.main.autoCompactWindow;
+    const w = settingsWritten(expected, ['autoCompactWindow'], decisions.find((t) => t.item === 'autoCompactWindow'));
+    const sessionsSeen: CompactSample[] = [];
+    for (const r of sessions.startedSince) {
+      if (sessions.takenOverMain(r.sid, 'compact')) continue;
+      const d = sessions.detail(r.sid);
+      if (!d || !d.summary.compactions.autoPreTokens.length) continue;
+      sessionsSeen.push({ sid: r.sid, at: d.summary.startedAt, preTokens: d.summary.compactions.autoPreTokens });
+    }
+    const item = compactItem(T, expected, w, sessionsSeen, since, desktopOnly, settingsError);
+    // 自动压缩关着：写了也没用
+    const enabled = node(['autoCompactEnabled']);
+    if (expected !== null && enabled?.type === 'boolean' && enabled.value === false) {
+      item.summary += ' 但设置文件里 autoCompactEnabled 为 false，自动压缩已经关闭，这个阈值不会生效。';
+      item.nextStep = '把 autoCompactEnabled 改回 true 或删掉，再新开会话。';
+    }
+    items.push(item);
+  }
+
   // ---------- advisor ----------
   let advisorCallsSince = 0;
   {
@@ -470,6 +499,7 @@ export function effectReport(input: EffectInput, deps: EffectDeps): EffectReport
     effort: preset.main.effort !== null || preset.agents.some((a) => a.effort !== null),
     agentModel: preset.agents.some((a) => a.model !== null),
     advisor: preset.advisor.model !== null,
+    compact: preset.main.autoCompactWindow !== null,
   });
   const subagentModel = deps.ctx.env.find((e) => e.name === 'CLAUDE_CODE_SUBAGENT_MODEL' && e.value !== null);
   const unspecified = preset.agents.filter((a) => a.model === null).map((a) => a.name);
@@ -582,6 +612,96 @@ function advisorItem(
     summary = T.writtenNoSession;
   }
   return { key: 'advisor', kind: 'advisor', name: null, expected, written, loaded: NA_LOADED, observed, writeEffective: true, summary, nextStep };
+}
+
+// ---------------- 自动压缩阈值 ----------------
+
+/** 起点之后自动压缩过的一个会话：它每次自动压缩前的上下文 token 数 */
+interface CompactSample {
+  sid: string;
+  at: string | null;
+  preTokens: number[];
+}
+
+/** 压缩前的 token 数落在阈值的 50% 到 105% 之间，算是"在阈值附近压缩" */
+export const COMPACT_LOW = 0.5;
+export const COMPACT_HIGH = 1.05;
+
+/** 上下文压缩的 token 数给人看的写法：498123 -> 498K */
+const preText = (n: number) => formatWindow(n);
+
+/**
+ * 自动压缩阈值的 observed：
+ *   有会话在超过阈值 5% 之后才压缩 -> mismatch（设置被忽略了）
+ *   否则有会话在阈值的 50% 到 105% 之间压缩 -> match
+ *   否则 not-seen：要么还没有会话达到阈值，要么压缩时的 token 数远低于阈值（模型上下文更小）
+ * count 是自动压缩过的会话数，matched 是其中在阈值附近压缩的；actual 是压缩前的 token 数，超过阈值的排在前面
+ */
+export function compactObserved(expected: number | null, samples: CompactSample[], since: string | null): EffectObserved {
+  const sorted = [...samples].sort((a, b) => (tsMs(a.at) ?? 0) - (tsMs(b.at) ?? 0));
+  const last = sorted[sorted.length - 1] ?? null;
+  if (expected === null) return { ...observedNA(since), count: sorted.length, lastSeenAt: last?.at ?? null, lastSessionId: last?.sid ?? null };
+  const over = (n: number) => n > expected * COMPACT_HIGH;
+  const near = (n: number) => !over(n) && n >= expected * COMPACT_LOW;
+  const bad = sorted.filter((s) => s.preTokens.some(over));
+  const good = sorted.filter((s) => !s.preTokens.some(over) && s.preTokens.some(near));
+  const all = sorted.flatMap((s) => s.preTokens);
+  const overValues = byFrequency(all.filter(over).map(preText));
+  return {
+    state: bad.length ? 'mismatch' : good.length ? 'match' : 'not-seen',
+    since,
+    count: sorted.length,
+    matched: good.length,
+    actual: [...overValues, ...byFrequency(all.filter((n) => !over(n)).map(preText)).filter((v) => !overValues.includes(v))],
+    lastSeenAt: last?.at ?? null,
+    lastSessionId: last?.sid ?? null,
+  };
+}
+
+function compactItem(
+  T: EffectTexts,
+  expected: number | null,
+  w: EffectWritten & { owned: boolean },
+  samples: CompactSample[],
+  since: string | null,
+  desktopOnly: boolean,
+  settingsError: string | null,
+): EffectItem {
+  const { owned: _o, ...written } = w;
+  const observed = compactObserved(expected, samples, since);
+  const label = '自动压缩阈值';
+  const x = expected === null ? null : `${preText(expected)}`;
+  let summary: string;
+  let nextStep: string | null = null;
+  const ws = writtenSummary(label, expected === null ? null : String(expected), w, settingsError);
+  if (ws !== null) {
+    summary = ws;
+    if ((w.state === 'no' || w.state === 'differs' || w.state === 'extra') && !settingsError) nextStep = T.applyHint;
+  } else if (observed.state === 'mismatch') {
+    // 只列超过阈值的那些值
+    const over = byFrequency(samples.flatMap((s) => s.preTokens).filter((n) => n > expected! * COMPACT_HIGH).map(preText));
+    summary = T.compactMismatch(over.join('、'), x!);
+  } else if (observed.state === 'match') {
+    summary = T.compactMatch(observed.matched, observed.actual.join('、'));
+  } else if (observed.count > 0) {
+    // 压缩过，但都远低于阈值
+    summary = (desktopOnly ? T.compactDesktopUnverified : '') + T.compactBelow(observed.actual.join('、'), x!);
+  } else {
+    summary = (desktopOnly ? T.compactDesktopUnverified : '') + T.compactNotReached;
+    nextStep = T.compactWait(x!);
+  }
+  return {
+    key: 'main.compact',
+    kind: 'main-compact',
+    name: null,
+    expected: x === null ? null : `${x} token`,
+    written,
+    loaded: NA_LOADED,
+    observed,
+    writeEffective: true,
+    summary,
+    nextStep,
+  };
 }
 
 function ruleItem(T: EffectTexts, filePath: string, includeRule: boolean, ruleText: string | null | undefined, since: string | null, advisorCalls: number): EffectItem {

@@ -3,13 +3,13 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Preset, PresetAgent, SchemeInfo, SchemeRef } from '../../shared/types.ts';
-import { agentreeHome, EFFORT_ORDER } from './config.ts';
+import { agentreeHome, AUTO_COMPACT_MAX, AUTO_COMPACT_MIN, EFFORT_ORDER, isValidAutoCompactWindow } from './config.ts';
 import { normalizeDir, schemeForSession } from './conformance.ts';
 
 export function defaultPreset(): Preset {
   return {
     version: 1,
-    main: { model: null, effort: null },
+    main: { model: null, effort: null, autoCompactWindow: null },
     advisor: { model: null },
     agents: [],
     allowBuiltins: true,
@@ -34,6 +34,13 @@ function optEffort(v: unknown, field: string): string | null {
     throw new Error(`${field} 必须是 ${EFFORT_ORDER.join('、')} 之一或 null`);
   }
   return s === null ? null : s.toLowerCase();
+}
+
+/** 自动压缩阈值：null / 缺失表示不指定；否则必须是 Claude Code 接受范围内的整数 */
+function optWindow(v: unknown, field: string): number | null {
+  if (v === null || v === undefined) return null;
+  if (!isValidAutoCompactWindow(v)) throw new Error(`${field} 必须是 ${AUTO_COMPACT_MIN} 到 ${AUTO_COMPACT_MAX} 之间的整数（token 数）或 null`);
+  return v;
 }
 
 export const DESCRIPTION_MAX = 4000;
@@ -114,7 +121,12 @@ export function validatePreset(input: unknown): Preset {
   if (o.allowBuiltins !== undefined && typeof o.allowBuiltins !== 'boolean') throw new Error('allowBuiltins 必须是布尔值');
   return {
     version: 1,
-    main: { model: optStr(main.model, 'main.model'), effort: optEffort(main.effort, 'main.effort') },
+    main: {
+      model: optStr(main.model, 'main.model'),
+      effort: optEffort(main.effort, 'main.effort'),
+      // 旧方案没有这个字段：当作不指定
+      autoCompactWindow: optWindow(main.autoCompactWindow, 'main.autoCompactWindow'),
+    },
     advisor: { model: optStr(advisor.model, 'advisor.model') },
     agents,
     allowBuiltins: o.allowBuiltins ?? true,
@@ -148,6 +160,8 @@ export interface AppliedRecord {
     model: string | null;
     advisorModel: string | null;
     effort: WrittenEffort | null;
+    /** 写过的 autoCompactWindow；旧记录没有这个字段时为 null */
+    autoCompactWindow: number | null;
   };
 }
 
@@ -209,7 +223,12 @@ function parseApplied(o: any): AppliedRecord | null {
       ? { where: e.where, model: e.where === 'top' ? null : e.model, value: e.value }
       : null;
   const str = (v: unknown) => (typeof v === 'string' ? v : null);
-  return { appliedAt: o.appliedAt, includeRule: o.includeRule === true, wrote: { model: str(w.model), advisorModel: str(w.advisorModel), effort } };
+  const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : null);
+  return {
+    appliedAt: o.appliedAt,
+    includeRule: o.includeRule === true,
+    wrote: { model: str(w.model), advisorModel: str(w.advisorModel), effort, autoCompactWindow: num(w.autoCompactWindow) },
+  };
 }
 
 /** 读一个项目方案文件；读不了或格式不对返回 null（当作不存在，不抛错） */

@@ -5,6 +5,7 @@ import type {
   AgentNode,
   AgentStatus,
   AgentTypeUsage,
+  CompactionStats,
   ModelUsage,
   Preset,
   SessionDetail,
@@ -99,6 +100,8 @@ interface NodeSpec {
   requestedModel?: string;
   advisorModel?: string;
   advisorCalls?: number;
+  /** 上下文压缩：自动压缩前的 token 数列表、手动压缩次数 */
+  compactions?: { autoPreTokens: number[]; manual?: number };
   /** 相对会话开始的分钟数 */
   start: number;
   /** 持续分钟数；运行中的节点省略 */
@@ -130,6 +133,8 @@ const LIVE_ROOT: NodeSpec = {
   efforts: E('xhigh'),
   advisorModel: OPUS,
   advisorCalls: 0,
+  // 在阈值 500K 附近自动压缩过一次
+  compactions: { autoPreTokens: [498_300] },
   start: 0,
   tools: 142,
   children: [
@@ -348,6 +353,8 @@ const SESSIONS: SessionSpec[] = [
       efforts: E('max'),
       advisorModel: OPUS,
       advisorCalls: 0,
+      // 到接近 1M 才自动压缩：说明当时 500K 的阈值没有生效；另外手动 /compact 过一次
+      compactions: { autoPreTokens: [966_800, 971_200], manual: 1 },
       start: 0,
       dur: 260,
       tools: 210,
@@ -480,6 +487,12 @@ export function currentToolFor(id: string): string {
   return TOOLS[i];
 }
 
+function compactionsOf(ns: NodeSpec): CompactionStats {
+  const auto = ns.compactions?.autoPreTokens ?? [];
+  const manual = ns.compactions?.manual ?? 0;
+  return { total: auto.length + manual, auto: auto.length, manual, autoPreTokens: [...auto] };
+}
+
 export function buildSession(spec: SessionSpec, preset: Preset, t0: number): SessionDetail {
   const now = Date.now();
   // 以模块加载时刻为基准，运行中的节点耗时会随时间增长
@@ -522,6 +535,7 @@ export function buildSession(spec: SessionSpec, preset: Preset, t0: number): Ses
       requestedModel: ns.requestedModel ?? null,
       advisorModel: ns.advisorModel ?? null,
       advisorCalls: ns.advisorCalls ?? 0,
+      compactions: compactionsOf(ns),
       conformance: { verdict: 'not-checked', presetAgent: null, checks: [] },
       children: [],
     };
@@ -614,6 +628,7 @@ export function buildSession(spec: SessionSpec, preset: Preset, t0: number): Ses
     mainEffort: main.efforts[main.efforts.length - 1] ?? null,
     advisorModel: main.advisorModel,
     advisorCalls: main.advisorCalls,
+    compactions: main.compactions,
     agentCount: ordered.length - 1,
     maxDepth: Math.max(...ordered.map((a) => a.depth)),
     requests: main.subtree.requests,
@@ -641,7 +656,7 @@ export function allSpecs(): SessionSpec[] {
 
 export const DEFAULT_MOCK_PRESET: Preset = {
   version: 1,
-  main: { model: 'opus', effort: 'xhigh' },
+  main: { model: 'opus', effort: 'xhigh', autoCompactWindow: 500_000 },
   advisor: { model: OPUS },
   agents: [
     { name: 'code-reviewer', model: 'sonnet', effort: 'high', note: '只读审查，不改代码' },

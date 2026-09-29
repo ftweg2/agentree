@@ -1,7 +1,7 @@
 import type { AgentNode, ConformanceCheck, TokenTotals } from '../../types';
 import { Cost, EffortTag, Flash, ModelTag, StatusBadge, Tok, VerdictBadge } from '../ui';
 import { ChecksList, ModelUsageTable } from '../tables';
-import { formatDuration, formatFullDateTime, fullNumber } from '../../lib/format';
+import { formatDuration, formatFullDateTime, fullNumber, shortNumber } from '../../lib/format';
 import { nodeLabel, type TreeIndex } from './treeModel';
 
 interface Props {
@@ -180,6 +180,36 @@ export default function NodeDetail({ node, index, sessionChecks, onSelect, onClo
               </div>
             ) : (
               <span className="dim small">未配置</span>
+            )}
+          </div>
+        )}
+
+        {(isMain || node.compactions.total > 0) && (
+          <div className="insp-sec">
+            <h3>上下文压缩</h3>
+            {node.compactions.total === 0 ? (
+              <span className="dim small">{isMain ? '主对话没有被压缩过' : '没有被压缩过'}</span>
+            ) : (
+              <div className="stack" style={{ gap: 6 }}>
+                <div className="row wrap">
+                  <span className="badge muted">共 {node.compactions.total} 次</span>
+                  <span className="small muted">
+                    自动 {node.compactions.auto} 次 · 手动（/compact）{node.compactions.manual} 次
+                    {node.compactions.total > node.compactions.auto + node.compactions.manual && ` · 不明 ${node.compactions.total - node.compactions.auto - node.compactions.manual} 次`}
+                  </span>
+                </div>
+                {node.compactions.autoPreTokens.length > 0 && (
+                  <div className="small muted">
+                    自动压缩前的上下文：
+                    {node.compactions.autoPreTokens.map((n, i) => (
+                      <span key={i} className="num" title={`${fullNumber(n)} token`} style={{ marginLeft: i ? 6 : 4 }}>
+                        {shortNumber(n)}
+                      </span>
+                    ))}
+                    <span className="dim"> token</span>
+                  </div>
+                )}
+              </div>
             )}
           </div>
         )}

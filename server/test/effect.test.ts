@@ -53,7 +53,7 @@ const reviewerPath = path.join(cfg, 'agents', 'reviewer.md');
 const PROMPT = 'SECRET-PROMPT 你是审查员，只读不改。\n';
 const P = {
   version: 1,
-  main: { model: 'claude-opus-5-5', effort: 'high' },
+  main: { model: 'claude-opus-5-5', effort: 'high', autoCompactWindow: null },
   advisor: { model: 'fable' },
   agents: [
     { name: 'reviewer', model: 'sonnet', effort: 'high', description: '改完代码之后审查', tools: 'Read, Grep', disallowedTools: 'Agent', prompt: PROMPT },
@@ -162,6 +162,7 @@ test('应用前：written 都是 no，agent 内置类型 n/a；返回内容里�
   assert.deepEqual(rep.items.map((i: any) => [i.key, i.written.state]), [
     ['main.model', 'no'],
     ['main.effort', 'no'],
+    ['main.compact', 'n/a'],
     ['advisor', 'no'],
     ['rule', 'no'],
     ['agent:reviewer', 'no'],
@@ -187,7 +188,7 @@ test('应用（prune）后：自动保存预设、写 applied.json；之后立�
   assert.deepEqual((await call('GET', '/api/preset', undefined, H)).body, a.body.preset, '预设已保存为检查标准');
   const rec = readApplied()!;
   assert.ok(rec.appliedAt >= a.body.preset.updatedAt);
-  assert.deepEqual(rec.wrote, { model: 'claude-opus-5-5', advisorModel: 'fable', effort: { where: 'modelSettings', model: 'claude-opus-5-5', value: 'high' } });
+  assert.deepEqual(rec.wrote, { model: 'claude-opus-5-5', advisorModel: 'fable', effort: { where: 'modelSettings', model: 'claude-opus-5-5', value: 'high' }, autoCompactWindow: null });
   assert.equal(rec.includeRule, true);
   assert.ok(fs.readFileSync(reviewerPath, 'utf8').includes('disallowedTools: Agent'));
 
@@ -209,7 +210,7 @@ test('不是 preset.apply 的计划：ApplyResult.preset 为 null；有失败项
 
   const savedPreset = fs.readFileSync(path.join(home, 'preset.json'));
   const savedApplied = fs.readFileSync(path.join(home, 'applied.json'));
-  const changed = { ...P, main: { model: 'claude-opus-5-5', effort: 'xhigh' } };
+  const changed = { ...P, main: { model: 'claude-opus-5-5', effort: 'xhigh', autoCompactWindow: null } };
   const p = await call('POST', '/api/config/plan', { actions: [{ type: 'preset.apply', preset: changed, includeRule: true, prune: true }] });
   assert.equal(p.body.changes.length, 1);
   fs.writeFileSync(settingsPath, fs.readFileSync(settingsPath, 'utf8').replace('"fable"', '"opus"')); // 外部改动 -> 冲突
@@ -357,16 +358,16 @@ test('written：differs / extra / n/a（不是 agentree 写的）；rule 的 dif
   fs.writeFileSync(settingsPath, s0);
 
   // 方案不指定主模型：agentree 写过且值没变 -> extra；没有记录，或值在写入之后被改过 -> n/a
-  const noMain = { ...P, main: { model: null, effort: null }, advisor: { model: null } };
+  const noMain = { ...P, main: { model: null, effort: null, autoCompactWindow: null }, advisor: { model: null } };
   rep = await effect(noMain);
   assert.equal(item(rep, 'main.model').written.state, 'extra');
   assert.equal(item(rep, 'main.effort').written.state, 'extra');
   assert.equal(item(rep, 'advisor').written.state, 'extra');
   const wrote0 = readApplied()!.wrote;
   for (const wrote of [
-    { model: null, advisorModel: null, effort: null },
+    { model: null, advisorModel: null, effort: null, autoCompactWindow: null },
     // 记录的值和现在的不同：写入之后被别的程序改过
-    { model: 'claude-sonnet-5', advisorModel: 'opus', effort: { ...wrote0.effort!, value: 'low' } },
+    { model: 'claude-sonnet-5', advisorModel: 'opus', effort: { ...wrote0.effort!, value: 'low' }, autoCompactWindow: null },
   ]) {
     writeApplied({ ...readApplied()!, wrote });
     rep = await effect(noMain);
@@ -465,7 +466,7 @@ test('blockers：只在方案涉及时给出；设置了 CLAUDE_CODE_SUBAGENT_MO
   assert.match(msgs, /CLAUDE_CODE_SUBAGENT_MODEL_FORCE/);
   assert.match(msgs, /CLAUDE_CODE_SUBAGENT_MODEL（haiku）：没有指定模型的 Explore/);
   const bare = effectReport(
-    { preset: { ...P, main: { model: null, effort: null }, advisor: { model: null }, agents: [{ name: 'reviewer', model: 'sonnet', effort: null }] }, includeRule: false },
+    { preset: { ...P, main: { model: null, effort: null, autoCompactWindow: null }, advisor: { model: null }, agents: [{ name: 'reviewer', model: 'sonnet', effort: null }] }, includeRule: false },
     { store, analyzer, ctx },
   );
   assert.deepEqual(bare.blockers.map((b) => b.message.slice(0, 20)), [

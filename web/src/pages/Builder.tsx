@@ -2,11 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import type { AgentTemplateInfo, ClaudeConfigSnapshot, ClaudeMdRuleState, EffectReport, Preset, PresetAgent, PresetTemplate, SchemeInfo } from '../types';
 import { api, ApiFailure } from '../api/client';
+import { launchCommand } from '../../../shared/launch';
 import { useApi } from '../lib/useApi';
+import { shortNumber } from '../lib/format';
 import { modelColor, shortModel } from '../lib/models';
 import { useTheme } from '../lib/theme';
 import { ErrorBox, Skeleton } from '../components/ui';
-import { EffortSelect, ModelInput } from '../components/inputs';
+import { CompactSelect, EffortSelect, ModelInput } from '../components/inputs';
 import PlanDialog from '../components/plan/PlanDialog';
 import Modal from '../components/Modal';
 import { Positioned } from '../components/tree/TreeCanvas';
@@ -147,7 +149,7 @@ function BuilderCanvas({ projectCwd, scopeBar, onSchemesChanged, onGoGlobal }: C
       for (const d of files.values()) agents.push(d);
       setGlobalScheme({
         version: 1,
-        main: scheme?.main ?? { model: null, effort: null },
+        main: scheme?.main ?? { model: null, effort: null, autoCompactWindow: null },
         advisor: scheme?.advisor ?? { model: null },
         agents,
         allowBuiltins: scheme?.allowBuiltins ?? true,
@@ -650,7 +652,7 @@ function BuilderCanvas({ projectCwd, scopeBar, onSchemesChanged, onGoGlobal }: C
   const selectedNode = selected?.t === 'node' ? (graph?.nodes.find((n) => n.id === selected.id) ?? null) : null;
   const pending = pendingCount(report);
   const writable = writableCount(report);
-  const empty = !!graph && graph.nodes.length === 1 && !main?.model && !main?.effort;
+  const empty = !!graph && graph.nodes.length === 1 && !main?.model && !main?.effort && main?.autoCompactWindow == null;
   const diskCount = (disk ?? []).length;
   const colorOf = (n: BNode) => ((n.kind === 'agent' || n.kind === 'main') && n.model ? modelColor(n.model, theme) : KIND_COLOR[n.kind]);
 
@@ -821,7 +823,7 @@ function BuilderCanvas({ projectCwd, scopeBar, onSchemesChanged, onGoGlobal }: C
                         className="starter-card rec"
                         onClick={() =>
                           replaceWith(
-                            { version: 1, main: { model: null, effort: null }, advisor: { model: null }, agents: globalAgents, allowBuiltins: globalScheme?.allowBuiltins ?? true, updatedAt: null },
+                            { version: 1, main: { model: null, effort: null, autoCompactWindow: null }, advisor: { model: null }, agents: globalAgents, allowBuiltins: globalScheme?.allowBuiltins ?? true, updatedAt: null },
                             false,
                             '已把全局方案的子 agent 复制到这个项目里。在这里改动不会影响全局方案。',
                             globalAgents,
@@ -923,11 +925,16 @@ function BuilderCanvas({ projectCwd, scopeBar, onSchemesChanged, onGoGlobal }: C
                         </div>
                       </div>
                       <div className="gl-list">
-                        {(globalScheme?.main.model || globalScheme?.main.effort || globalScheme?.advisor.model) && (
+                        {(globalScheme?.main.model || globalScheme?.main.effort || globalScheme?.main.autoCompactWindow || globalScheme?.advisor.model) && (
                           <div className="gl-row">
                             <span className="k">主会话</span>
                             <span className="v">
-                              {[globalScheme.main.model && shortModel(globalScheme.main.model), globalScheme.main.effort, globalScheme.advisor.model && `advisor ${shortModel(globalScheme.advisor.model)}`]
+                              {[
+                                globalScheme.main.model && shortModel(globalScheme.main.model),
+                                globalScheme.main.effort,
+                                globalScheme.main.autoCompactWindow && `压缩 ${shortNumber(globalScheme.main.autoCompactWindow)}`,
+                                globalScheme.advisor.model && `advisor ${shortModel(globalScheme.advisor.model)}`,
+                              ]
                                 .filter(Boolean)
                                 .join(' · ')}
                             </span>
@@ -1146,6 +1153,15 @@ function BuilderCanvas({ projectCwd, scopeBar, onSchemesChanged, onGoGlobal }: C
                             </>
                           )}
                           {n.kind === 'main' && (
+                            <>
+                              <label htmlFor={`${n.id}-compact`} title="上下文累积到这么多 token 时自动压缩对话（settings 的 autoCompactWindow）">
+                                自动压缩
+                              </label>
+                              <CompactSelect id={`${n.id}-compact`} value={n.autoCompactWindow} onChange={(v) => patch(n.id, { autoCompactWindow: v })} emptyLabel={projectCwd ? '跟全局一样' : '不指定'} />
+                              {nodeIssues?.find((x) => x.field === 'compact') && <div className="err">{nodeIssues.find((x) => x.field === 'compact')!.text}</div>}
+                            </>
+                          )}
+                          {n.kind === 'main' && (
                             <label className="switch full" title="关闭后，实际运行时派发了 Explore、Plan 这类内置类型会被标为“预设外”。这个开关只影响检查，不会禁止主会话使用内置类型">
                               <input
                                 type="checkbox"
@@ -1344,7 +1360,7 @@ function BuilderCanvas({ projectCwd, scopeBar, onSchemesChanged, onGoGlobal }: C
                         disabled={!current || blocking}
                         onClick={() => {
                           setMenu(null);
-                          if (current) setCommand(launchCommand(current, projectCwd));
+                          if (current) setCommand(launchCommand(current, projectCwd, isBuiltin));
                         }}
                         title="生成一条命令行启动命令：只对那一次会话生效，不写入任何文件"
                       >
@@ -1456,7 +1472,7 @@ function BuilderCanvas({ projectCwd, scopeBar, onSchemesChanged, onGoGlobal }: C
         >
           <div className="stack" style={{ gap: 12 }}>
             <div className="small muted" style={{ lineHeight: 1.7 }}>
-              用这条命令启动的会话会带上画布上的子 agent、主模型和 effort，<b>只对这一次会话有效</b>，不写入任何文件，也不影响全局方案和项目方案。
+              用这条命令启动的会话会带上画布上的子 agent、主模型、effort 和自动压缩阈值，<b>只对这一次会话有效</b>，不写入任何文件，也不影响全局方案和项目方案。
               <br />
               这是 Claude Code 命令行才有的功能。桌面版启动会话时没有对应的入口，想在桌面版里给某些会话单独一套方案，请用项目方案。
             </div>
@@ -1466,33 +1482,6 @@ function BuilderCanvas({ projectCwd, scopeBar, onSchemesChanged, onGoGlobal }: C
       )}
     </div>
   );
-}
-
-/** 生成只对一次会话生效的命令行启动命令（PowerShell 写法） */
-function launchCommand(p: Preset, cwd: string | null): string {
-  const list = (v: string | null | undefined) =>
-    (v ?? '')
-      .split(',')
-      .map((t) => t.trim())
-      .filter(Boolean);
-  const agents: Record<string, Record<string, unknown>> = {};
-  for (const a of p.agents) {
-    if (isBuiltin(a.name)) continue;
-    const def: Record<string, unknown> = { description: a.description ?? a.note ?? a.name, prompt: a.prompt ?? '' };
-    if (a.tools) def.tools = list(a.tools);
-    if (a.disallowedTools) def.disallowedTools = list(a.disallowedTools);
-    if (a.model) def.model = a.model;
-    if (a.effort) def.effort = a.effort;
-    agents[a.name] = def;
-  }
-  const args = ['claude'];
-  if (p.main.model) args.push('--model', p.main.model);
-  if (p.main.effort) args.push('--effort', p.main.effort);
-  const lines: string[] = [];
-  if (cwd) lines.push(`Set-Location "${cwd}"`);
-  if (Object.keys(agents).length) lines.push(`${args.join(' ')} --agents @'`, JSON.stringify(agents, null, 2), "'@");
-  else lines.push(args.join(' '));
-  return lines.join('\n');
 }
 
 /**

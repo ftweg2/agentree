@@ -28,6 +28,8 @@ export interface BNode {
   disallowedTools: string | null;
   /** 系统提示词 */
   prompt: string;
+  /** 自动压缩阈值（token 数）；只有主会话用。null 表示不指定，跟 Claude Code 默认 */
+  autoCompactWindow: number | null;
 }
 
 export interface Graph {
@@ -50,7 +52,7 @@ export const portY = (i: number) => HEAD + PORT_TOP + PORT_H * i + PORT_H / 2;
 
 /** 各类节点的大致高度，只用于自动排列和适应窗口 */
 export const NODE_H: Record<Kind, number> = {
-  main: 240,
+  main: 274,
   advisor: 162,
   rule: 134,
   agent: 310,
@@ -94,9 +96,15 @@ export function blankNode(kind: Kind, init?: Partial<BNode>): BNode {
     tools: null,
     disallowedTools: null,
     prompt: '',
+    autoCompactWindow: null,
     ...init,
   };
 }
+
+/** Claude Code 接受的自动压缩阈值范围（token 数） */
+export const COMPACT_MIN = 100_000;
+export const COMPACT_MAX = 1_000_000;
+export const isValidWindow = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= COMPACT_MIN && v <= COMPACT_MAX;
 
 /**
  * 存在本机的内容，和预设本身分开：
@@ -130,6 +138,7 @@ function readNode(raw: unknown): BNode | null {
     tools: opt(n.tools),
     disallowedTools: opt(n.disallowedTools),
     prompt: str(n.prompt),
+    autoCompactWindow: n.kind === 'main' && isValidWindow(n.autoCompactWindow) ? n.autoCompactWindow : null,
   });
 }
 
@@ -263,6 +272,7 @@ export function graphFromPreset(p: Preset, stored: Omit<Stored, 'draft'>, disk: 
     blankNode('main', {
       model: p.main?.model ?? null,
       effort: p.main?.effort ?? null,
+      autoCompactWindow: p.main?.autoCompactWindow ?? null,
     }),
   );
   if (p.advisor?.model) {
@@ -339,7 +349,7 @@ export function presetFromGraph(g: Graph, updatedAt: string | null, skipInvalid 
   }
   return {
     version: 1,
-    main: { model: clean(main.model), effort: clean(main.effort) },
+    main: { model: clean(main.model), effort: clean(main.effort), autoCompactWindow: isValidWindow(main.autoCompactWindow) ? main.autoCompactWindow : null },
     advisor: { model: advisor ? clean(advisor.model) : null },
     agents,
     allowBuiltins: g.allowBuiltins,
@@ -349,7 +359,7 @@ export function presetFromGraph(g: Graph, updatedAt: string | null, skipInvalid 
 
 export function comparable(p: Preset) {
   return JSON.stringify({
-    main: { model: clean(p.main?.model), effort: clean(p.main?.effort) },
+    main: { model: clean(p.main?.model), effort: clean(p.main?.effort), autoCompactWindow: p.main?.autoCompactWindow ?? null },
     advisor: { model: clean(p.advisor?.model) },
     agents: (p.agents ?? [])
       .map((a) => ({
@@ -376,7 +386,7 @@ export function nameError(name: string): string | null {
 export interface NodeIssue {
   /** error 会阻止保存和应用；warn 只是提醒 */
   level: 'error' | 'warn';
-  field: 'name' | 'description' | 'prompt' | 'model';
+  field: 'name' | 'description' | 'prompt' | 'model' | 'compact';
   text: string;
 }
 
@@ -416,6 +426,12 @@ export function validate(g: Graph): Map<string, NodeIssue[]> {
         level: 'error',
         field: 'model',
         text: '还没选 advisor 用哪个模型',
+      });
+    if (n.kind === 'main' && n.autoCompactWindow !== null && !isValidWindow(n.autoCompactWindow))
+      issues.push({
+        level: 'error',
+        field: 'compact',
+        text: `自动压缩阈值要在 ${COMPACT_MIN / 1000}K 到 ${COMPACT_MAX / 1000}K token 之间`,
       });
     if (issues.length) out.set(n.id, issues);
   }
@@ -661,7 +677,7 @@ export const worst = (states: NodeState[]): NodeState => states.reduce<NodeState
 
 export function itemsOf(n: BNode, report: EffectReport | null): EffectItem[] {
   if (!report) return [];
-  if (n.kind === 'main') return report.items.filter((i) => i.kind === 'main-model' || i.kind === 'main-effort');
+  if (n.kind === 'main') return report.items.filter((i) => i.kind === 'main-model' || i.kind === 'main-effort' || i.kind === 'main-compact');
   if (n.kind === 'advisor') return report.items.filter((i) => i.kind === 'advisor');
   if (n.kind === 'rule') return report.items.filter((i) => i.kind === 'rule');
   return report.items.filter((i) => i.kind === 'agent' && i.name === n.name.trim());

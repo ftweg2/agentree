@@ -212,6 +212,10 @@ function config(): ClaudeConfigSnapshot {
       { name: 'CLAUDE_CODE_SUBAGENT_MODEL', value: 'claude-sonnet-5', scope: 'user', level: 'warn', impact: '子 agent 没有指定模型时使用 claude-sonnet-5，而不是主会话的模型。' },
       { name: 'CLAUDE_CODE_SUBAGENT_MODEL_FORCE', value: null, scope: 'user', level: 'ok', impact: '未设置。设置后所有子 agent 强制使用同一个模型。' },
       { name: 'CLAUDE_CODE_DISABLE_ADVISOR_TOOL', value: null, scope: 'user', level: 'ok', impact: '未设置。设置为 1 会禁用 advisor。' },
+      { name: 'CLAUDE_CODE_AUTO_COMPACT_WINDOW', value: null, scope: 'user', level: 'ok', impact: '未设置。设置后会覆盖 settings.json 里的 autoCompactWindow。' },
+      { name: 'DISABLE_AUTO_COMPACT', value: null, scope: 'user', level: 'ok', impact: '未设置。设置为 1 会关闭自动压缩，autoCompactWindow 不生效。' },
+      { name: 'DISABLE_COMPACT', value: null, scope: 'user', level: 'ok', impact: '未设置。设置为 1 会关闭所有压缩。' },
+      { name: 'CLAUDE_AUTOCOMPACT_PCT_OVERRIDE', value: null, scope: 'user', level: 'ok', impact: '未设置。设置后会把自动压缩的触发点降到阈值的这个百分比。' },
       { name: 'DISABLE_TELEMETRY', value: '1', scope: 'machine', level: 'warn', impact: '会导致功能开关无法拉取，advisor 可能不可用。' },
       { name: 'CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC', value: null, scope: 'user', level: 'ok', impact: '未设置。设置后功能开关无法拉取，advisor 可能不可用。' },
       { name: 'CLAUDE_CONFIG_DIR', value: null, scope: 'user', level: 'info', impact: '未设置，使用默认配置目录 C:\\Users\\you\\.claude。' },
@@ -227,7 +231,7 @@ function presetFromConfig(): Preset {
   const c = config();
   return {
     version: 1,
-    main: { model: c.settings.model, effort: c.settings.effortLevel },
+    main: { model: c.settings.model, effort: c.settings.effortLevel, autoCompactWindow: c.settings.autoCompactWindow },
     advisor: { model: c.settings.advisorModel },
     agents: c.definitions.map((d) => ({
       name: d.name,

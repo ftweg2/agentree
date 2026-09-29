@@ -149,7 +149,7 @@ export function checkEffort(expected: string | null, efforts: string[]): Conform
 }
 
 export function isPresetEmpty(p: Preset): boolean {
-  return p.agents.length === 0 && !p.main.model && !p.main.effort && !p.advisor.model;
+  return p.agents.length === 0 && !p.main.model && !p.main.effort && p.main.autoCompactWindow === null && !p.advisor.model;
 }
 
 // ---------------- 方案的范围与叠加 ----------------
@@ -182,13 +182,17 @@ export function owningProject(cwd: string | null, projectCwds: string[]): string
 /**
  * 项目方案叠在全局方案上，得到一个项目里实际生效的方案（契约 Preset 上方的注释）：
  *   子 agent 取并集，同名用项目的（名字不区分大小写）；
- *   主模型、主 effort、advisor 项目为 null 时用全局的；allowBuiltins 用项目的
+ *   主模型、主 effort、advisor、自动压缩阈值 项目为 null 时用全局的；allowBuiltins 用项目的
  */
 export function overlayPreset(global: Preset, project: Preset): Preset {
   const own = new Set(project.agents.map((a) => a.name.toLowerCase()));
   return {
     version: 1,
-    main: { model: project.main.model ?? global.main.model, effort: project.main.effort ?? global.main.effort },
+    main: {
+      model: project.main.model ?? global.main.model,
+      effort: project.main.effort ?? global.main.effort,
+      autoCompactWindow: project.main.autoCompactWindow ?? global.main.autoCompactWindow,
+    },
     advisor: { model: project.advisor.model ?? global.advisor.model },
     agents: [...project.agents, ...global.agents.filter((a) => !own.has(a.name.toLowerCase()))],
     allowBuiltins: project.allowBuiltins,

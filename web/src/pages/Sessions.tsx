@@ -188,6 +188,9 @@ export default function SessionsPage() {
                     <th>最近活动</th>
                     <th>主模型</th>
                     <th className="num">子 agent</th>
+                    <th className="num" title="主对话被压缩的次数（自动 / 手动）">
+                      压缩
+                    </th>
                     <th className="num">请求</th>
                     <th className="num">token</th>
                     <th className="num">费用</th>
@@ -231,6 +234,9 @@ export default function SessionsPage() {
                       <td className="num">
                         {s.agentCount}
                         {s.maxDepth > 1 && <span className="dim small" title="最大嵌套深度"> ·{s.maxDepth}层</span>}
+                      </td>
+                      <td className="num" title={s.compactions.total ? `自动 ${s.compactions.auto} 次，手动 ${s.compactions.manual} 次` : '没有被压缩过'}>
+                        {s.compactions.total ? s.compactions.total : <span className="dim">—</span>}
                       </td>
                       <td className="num">{fullNumber(s.requests)}</td>
                       <td className="num">

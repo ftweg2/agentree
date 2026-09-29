@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import type { AgentTemplateInfo, ClaudeMdRuleState, EffectItem, EffectReport, PlanNote } from '../../types';
 import { relativeTime as formatRelative } from '../../lib/format';
-import { EffortSelect, ModelInput } from '../inputs';
+import { CompactSelect, EffortSelect, ModelInput } from '../inputs';
 import Modal from '../Modal';
 import {
   canSpawn,
@@ -235,6 +235,22 @@ export default function Inspector(p: Props) {
           </div>
         )}
 
+        {n.kind === 'main' && (
+          <div className="insp-sec" data-sec="compact">
+            <h3>自动压缩阈值</h3>
+            <div className="field-grid">
+              <label htmlFor="bi-compact">阈值</label>
+              <CompactSelect id="bi-compact" value={n.autoCompactWindow} onChange={(v) => p.onPatch({ autoCompactWindow: v })} />
+            </div>
+            {issueOf('compact') && <div className="field-err">{issueOf('compact')!.text}</div>}
+            <div className="field-hint" style={{ marginTop: 10 }}>
+              上下文累积到这么多 token 时，Claude Code 会自动把之前的对话压缩成摘要（写到 settings 的 <span className="mono">autoCompactWindow</span>）。
+              不指定时用 Claude Code 的默认：1M 上下文的模型约 967K，200K 的模型 200K。设得再高也不会超过模型自己的上下文上限；设低一些可以让长会话更早瘦身，但会更早丢掉细节。
+              环境变量 <span className="mono">CLAUDE_CODE_AUTO_COMPACT_WINDOW</span> 和 <span className="mono">DISABLE_AUTO_COMPACT</span> 会让这个设置失效，配置页的环境变量检查会列出来。
+            </div>
+          </div>
+        )}
+
         {n.kind === 'advisor' && (
           <div className="insp-sec" data-sec="model">
             <h3>顾问模型</h3>
@@ -458,6 +474,8 @@ const O_LABEL: Record<EffectItem['observed']['state'], string> = {
 };
 /** 主模型和 effort 看的是最近的会话，说法和子 agent 不一样 */
 const O_MAIN_LABEL: Record<EffectItem['observed']['state'], string> = { match: '最近的会话符合', mismatch: '最近的会话不符合', 'not-seen': '还没有新会话', 'n/a': '无法判断' };
+/** 自动压缩阈值看的是会话在多少 token 时自动压缩 */
+const O_COMPACT_LABEL: Record<EffectItem['observed']['state'], string> = { match: '有会话在阈值附近压缩过', mismatch: '有会话超过阈值才压缩', 'not-seen': '还没有会话达到阈值', 'n/a': '无法判断' };
 const FIELD_LABEL: Record<string, string> = {
   model: '模型',
   effort: 'effort',
@@ -471,6 +489,7 @@ const FIELD_LABEL: Record<string, string> = {
 const ITEM_LABEL: Record<EffectItem['kind'], string> = {
   'main-model': '主模型',
   'main-effort': '主会话 effort',
+  'main-compact': '自动压缩阈值',
   advisor: 'advisor',
   rule: 'CLAUDE.md 规则',
   agent: '定义文件',
@@ -546,14 +565,28 @@ export function EffectList({ items, loading, invalid, onPull, showTitle = true }
               <div>
                 <div className="k">实际运行</div>
                 <div className="v">
-                  {(it.kind === 'main-model' || it.kind === 'main-effort' ? O_MAIN_LABEL : O_LABEL)[it.observed.state]}
+                  {(it.kind === 'main-model' || it.kind === 'main-effort' ? O_MAIN_LABEL : it.kind === 'main-compact' ? O_COMPACT_LABEL : O_LABEL)[it.observed.state]}
                   {it.observed.count > 0 && (
                     <span className="dim">
-                      （{it.kind === 'advisor' ? `被调用 ${it.observed.count} 次` : it.kind === 'agent' ? `${it.observed.count} 次里 ${it.observed.matched} 次符合` : `${it.observed.count} 个会话里 ${it.observed.matched} 个符合`}）
+                      （
+                      {it.kind === 'advisor'
+                        ? `被调用 ${it.observed.count} 次`
+                        : it.kind === 'agent'
+                          ? `${it.observed.count} 次里 ${it.observed.matched} 次符合`
+                          : it.kind === 'main-compact'
+                            ? `${it.observed.count} 个会话自动压缩过，${it.observed.matched} 个在阈值附近`
+                            : `${it.observed.count} 个会话里 ${it.observed.matched} 个符合`}
+                      ）
                     </span>
                   )}
                 </div>
-                {it.observed.actual.length > 0 && it.observed.state !== 'match' && <div className="d">实际用的是：{it.observed.actual.join('、')}</div>}
+                {it.observed.actual.length > 0 && it.observed.state !== 'match' && (
+                  <div className="d">
+                    {it.kind === 'main-compact' ? '压缩前的上下文：' : '实际用的是：'}
+                    {it.observed.actual.join('、')}
+                    {it.kind === 'main-compact' ? ' token' : ''}
+                  </div>
+                )}
                 {it.observed.lastSessionId && (
                   <div className="d">
                     最近一次 {formatRelative(it.observed.lastSeenAt)} · <Link to={`/sessions/${encodeURIComponent(it.observed.lastSessionId)}`}>看那个会话</Link>

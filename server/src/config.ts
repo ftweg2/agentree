@@ -61,3 +61,17 @@ export const BUILTIN_AGENT_TYPES = [
 ];
 
 export const EFFORT_ORDER = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+/** Claude Code 接受的 autoCompactWindow 范围（官方文档 settings-reference：100000 到 1000000 个 token） */
+export const AUTO_COMPACT_MIN = 100_000;
+export const AUTO_COMPACT_MAX = 1_000_000;
+
+export function isValidAutoCompactWindow(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= AUTO_COMPACT_MIN && v <= AUTO_COMPACT_MAX;
+}
+
+/** 自动压缩阈值给人看的短写法：500000 -> 500K，1000000 -> 1M */
+export function formatWindow(n: number): string {
+  if (n >= 1_000_000 && n % 100_000 === 0) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`;
+  return `${Math.round(n / 1000)}K`;
+}

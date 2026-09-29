@@ -134,7 +134,7 @@ export const PRESET_TEMPLATES: PresetTemplate[] = [
       '主会话用 Opus 5.5 高强度运行，三个子 agent 分别负责读代码、改代码、查文档，用 Opus 5.5 中等强度；Fable 5.1 作为顾问，在关键节点给建议',
     preset: {
       version: 1,
-      main: { model: 'claude-opus-5-5', effort: 'high' },
+      main: { model: 'claude-opus-5-5', effort: 'high', autoCompactWindow: null },
       advisor: { model: 'fable' },
       agents: [templateAgent('explorer', 'opus', 'medium'), templateAgent('worker', 'opus', 'medium'), templateAgent('researcher', 'opus', 'medium')],
       allowBuiltins: true,

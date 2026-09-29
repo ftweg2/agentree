@@ -62,6 +62,20 @@ export interface ListingDelta {
   removed: string[];
 }
 
+/**
+ * 一次上下文压缩（type 为 system、subtype 为 compact_boundary 的记录）。
+ * 字段名来自 Claude Code 的文档，但格式标注为内部格式，所以宽松处理：没有 compactMetadata 也算一次压缩，
+ * trigger 记为 unknown、preTokens 记为 null。压缩后的摘要本身（下一条 isCompactSummary 的用户消息）不保留
+ */
+export interface CompactionRow {
+  /** 去重键：记录的 uuid；没有时退回时间戳 */
+  key: string;
+  trigger: 'auto' | 'manual' | 'unknown';
+  /** 压缩前的上下文 token 数 */
+  preTokens: number | null;
+  ts: string | null;
+}
+
 export interface SessionPatch {
   cwd: string | null;
   entrypoint: string | null;
@@ -221,6 +235,7 @@ export class LineBatch {
   results = new Map<string, AgentResultRow>();
   notifications: NotificationRow[] = [];
   listings: ListingDelta[] = [];
+  compactions: CompactionRow[] = [];
   session: SessionPatch = {
     cwd: null,
     entrypoint: null,
@@ -254,6 +269,7 @@ export class LineBatch {
       this.results.size === 0 &&
       this.notifications.length === 0 &&
       this.listings.length === 0 &&
+      this.compactions.length === 0 &&
       this.minTs === null &&
       this.badLines === 0 &&
       Object.values(this.session).every((v) => v === null)
@@ -303,7 +319,19 @@ export class LineBatch {
         const removed = names(a.removedTypes);
         if (added.length || removed.length) this.listings.push({ ts, added, removed });
       }
+    } else if (type === 'system' && o.subtype === 'compact_boundary') {
+      this.onCompactBoundary(o, ts);
     }
+  }
+
+  private onCompactBoundary(o: Record<string, any>, ts: string | null) {
+    const meta = obj(o.compactMetadata);
+    const trig = meta ? str(meta.trigger) : null;
+    const pre = meta && typeof meta.preTokens === 'number' && Number.isFinite(meta.preTokens) && meta.preTokens >= 0 ? Math.round(meta.preTokens) : null;
+    // 同一批里重复的键（文件被重写后从头重读）只记一次
+    const key = str(o.uuid) ?? (ts ? `ts:${ts}` : `line:${this.lines}`);
+    if (this.compactions.some((c) => c.key === key)) return;
+    this.compactions.push({ key, trigger: trig === 'auto' || trig === 'manual' ? trig : 'unknown', preTokens: pre, ts });
   }
 
   private patchSession(o: Record<string, any>) {

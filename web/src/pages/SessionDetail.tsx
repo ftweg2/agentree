@@ -4,7 +4,7 @@ import type { AgentNode, SessionDetail } from '../types';
 import { api } from '../api/client';
 import { useApi, useLocalState } from '../lib/useApi';
 import { useThumb } from '../lib/motion';
-import { formatDateTime, formatDuration, fullNumber, projectLabel } from '../lib/format';
+import { formatDateTime, formatDuration, fullNumber, projectLabel, shortNumber } from '../lib/format';
 import { Cost, EffortTag, Empty, ErrorBox, ModelTag, Num, Skeleton, StatusBadge, Tok, VerdictBadge, VerdictMark } from '../components/ui';
 import { AgentTypeTable, ChecksList, ModelUsageTable } from '../components/tables';
 import TreeCanvas, { type Orientation } from '../components/tree/TreeCanvas';
@@ -236,6 +236,29 @@ export default function SessionDetailPage() {
               <Num n={s.agentCount} animate />
             </b>
             <span className="dim">最深 {s.maxDepth} 层</span>
+          </span>
+          <span
+            className="fact"
+            title={
+              s.compactions.total === 0
+                ? '主对话没有被压缩过'
+                : `主对话被压缩了 ${s.compactions.total} 次：自动 ${s.compactions.auto} 次，手动（/compact）${s.compactions.manual} 次${
+                    s.compactions.autoPreTokens.length ? `。自动压缩前的上下文：${s.compactions.autoPreTokens.map((n) => fullNumber(n)).join('、')} token` : ''
+                  }`
+            }
+          >
+            压缩{' '}
+            {s.compactions.total === 0 ? (
+              <span className="dim">无</span>
+            ) : (
+              <>
+                <b>{s.compactions.total} 次</b>
+                <span className="dim">
+                  自动 {s.compactions.auto} · 手动 {s.compactions.manual}
+                  {s.compactions.autoPreTokens.length > 0 && ` · ${s.compactions.autoPreTokens.map((n) => shortNumber(n)).join('、')}`}
+                </span>
+              </>
+            )}
           </span>
           <span className="fact">
             请求{' '}

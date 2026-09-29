@@ -9,7 +9,7 @@ import type {
 } from '../types';
 import { api } from '../api/client';
 import { useApi, type ApiState } from '../lib/useApi';
-import { formatFullDateTime, fullNumber, relativeTime } from '../lib/format';
+import { formatFullDateTime, fullNumber, relativeTime, shortNumber } from '../lib/format';
 import { Empty, ErrorBox, Loading, ModelTag } from '../components/ui';
 import { EffortSelect, ModelInput } from '../components/inputs';
 import EnvTable from '../components/EnvTable';
@@ -336,6 +336,25 @@ function MainSection({ c, onPlan }: { c: ClaudeConfigSnapshot; onPlan: (title: s
           <div>
             <EffortSelect value={f.effort} onChange={(v) => setF({ ...f, effort: v })} emptyLabel="不设置" allowMax={false} />
             <div className="field-hint">对 Opus 5、Fable 5.1 及更早的模型有效；Opus 5.5 及之后的模型会忽略它，请在下面按模型设置。settings 不接受 max。</div>
+          </div>
+          <label>自动压缩阈值</label>
+          <div>
+            <div className="field-hint" style={{ marginTop: 0 }}>
+              当前 autoCompactWindow：
+              {s.autoCompactWindow != null ? (
+                <span className="mono">
+                  {fullNumber(s.autoCompactWindow)}（约 {shortNumber(s.autoCompactWindow)} token）
+                </span>
+              ) : (
+                '未设置（跟 Claude Code 默认：1M 上下文的模型约 967K，200K 的模型 200K）'
+              )}
+              {s.autoCompactEnabled === false && (
+                <>
+                  ；<span style={{ color: 'var(--warn)' }}>autoCompactEnabled 为 false，自动压缩已关闭</span>
+                </>
+              )}
+              。这一项在搭建页的主会话节点上设置，作为方案的一部分写入和检查。
+            </div>
           </div>
           <label className="top">按模型的 effort</label>
           <div className="stack" style={{ gap: 6 }}>

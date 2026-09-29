@@ -11,7 +11,7 @@ function snap(settings: Partial<ClaudeConfigSnapshot['settings']> = {}): ClaudeC
       { name: 'reviewer', source: 'project', filePath: 'b.md', description: null, model: 'inherit', effort: 'bogus', tools: null, projectCwd: 'C:\p' },
       { name: 'proj-only', source: 'project', filePath: 'c.md', description: null, model: 'opus', effort: null, tools: null, projectCwd: 'C:\p' },
     ],
-    settings: { effortLevel: null, model: null, advisorModel: null, modelEffort: {}, ...settings },
+    settings: { effortLevel: null, model: null, advisorModel: null, modelEffort: {}, autoCompactWindow: null, autoCompactEnabled: null, ...settings },
     env: [],
     builtinAgentTypes: [],
     ccSwitchDetected: false,
@@ -21,7 +21,7 @@ function snap(settings: Partial<ClaudeConfigSnapshot['settings']> = {}): ClaudeC
 
 test('从配置生成预设：settings.json 为空时用桌面版最近会话的 model/effort 和日志上的 advisorModel 兜底', () => {
   const p = presetFromConfig(snap(), { model: 'claude-fable-5-1', effort: 'xhigh', advisorModel: 'claude-opus-5-5' });
-  assert.deepEqual(p.main, { model: 'claude-fable-5-1', effort: 'xhigh' });
+  assert.deepEqual(p.main, { model: 'claude-fable-5-1', effort: 'xhigh', autoCompactWindow: null });
   assert.deepEqual(p.advisor, { model: 'claude-opus-5-5' });
   assert.equal(p.updatedAt, null);
   // 只取用户级定义：preset.apply 只写用户级文件，项目级的（同名的和只在项目里有的）都不进预设
@@ -37,11 +37,18 @@ test('从配置生成预设：settings.json 有值时优先，兜底不覆盖；
     effort: 'xhigh',
     advisorModel: 'claude-opus-5-5',
   });
-  assert.deepEqual(p.main, { model: 'opus', effort: 'high' });
+  assert.deepEqual(p.main, { model: 'opus', effort: 'high', autoCompactWindow: null });
   assert.equal(p.advisor.model, 'claude-opus-5');
   const q = presetFromConfig(snap({ model: 'opus' }), { model: 'x', effort: 'turbo', advisorModel: null });
-  assert.deepEqual(q.main, { model: 'opus', effort: null });
-  assert.deepEqual(presetFromConfig(snap(), null).main, { model: null, effort: null });
+  assert.deepEqual(q.main, { model: 'opus', effort: null, autoCompactWindow: null });
+  assert.deepEqual(presetFromConfig(snap(), null).main, { model: null, effort: null, autoCompactWindow: null });
+});
+
+test('从配置生成预设：settings.json 里的 autoCompactWindow 在 Claude Code 接受的范围内才进预设', () => {
+  assert.equal(presetFromConfig(snap({ autoCompactWindow: 500000 }), null).main.autoCompactWindow, 500000);
+  assert.equal(presetFromConfig(snap({ autoCompactWindow: 50000 }), null).main.autoCompactWindow, null, '低于 100000：当作没设置');
+  assert.equal(presetFromConfig(snap({ autoCompactWindow: 2_000_000 }), null).main.autoCompactWindow, null, '高于 1000000：当作没设置');
+  assert.equal(presetFromConfig(snap({ autoCompactWindow: 500000.5 }), null).main.autoCompactWindow, null, '不是整数：当作没设置');
 });
 
 test('环境变量值超过 12 个字符只返回前 4 位加省略号', () => {

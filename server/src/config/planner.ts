@@ -15,7 +15,7 @@ import type {
   Preset,
   PresetAgent,
 } from '../../../shared/types.ts';
-import { BUILTIN_AGENT_TYPES, claudeConfigDirs } from '../config.ts';
+import { AUTO_COMPACT_MAX, AUTO_COMPACT_MIN, BUILTIN_AGENT_TYPES, claudeConfigDirs, formatWindow, isValidAutoCompactWindow } from '../config.ts';
 import { modelFamily, normalizeModel, MODEL_ALIASES } from '../conformance.ts';
 import { sameTools, validatePreset, type AppliedRecord, type EffortLocation } from '../preset.ts';
 import { getBackup } from './backups.ts';
@@ -44,6 +44,9 @@ export const PLAN_TTL_MS = 10 * 60_000;
 export const PLAN_DESKTOP_MAIN_NOTE =
   '桌面版不读配置文件里的主模型和 effort，每个会话用的是发送框旁边选择器里选的值。这次写入只对命令行和 VS Code 里启动的会话有效。';
 export const PLAN_DESKTOP_ADVISOR_NOTE = '桌面版是否读取配置文件里的 advisor 设置还没有验证。如果没有生效，可以在对话里输入 /advisor <模型> 来指定。';
+export const PLAN_DESKTOP_COMPACT_NOTE = '桌面版是否读取配置文件里的 autoCompactWindow 还没有验证。写入之后，搭建页的生效检查会根据实际压缩的时机告诉你有没有生效。';
+/** 设置文件里 autoCompactEnabled 为 false 时的提示 */
+export const PLAN_COMPACT_DISABLED_NOTE = '设置文件里 autoCompactEnabled 为 false：自动压缩已经关闭，写入的 autoCompactWindow 不会生效。要用它请先把 autoCompactEnabled 改回 true 或删掉';
 export const SETTINGS_EFFORTS = ['low', 'medium', 'high', 'xhigh'];
 export const AGENT_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'];
 
@@ -124,10 +127,10 @@ export function effortPath(loc: EffortLocation): string[] {
 const samePath = (a: string[], b: string[]) => a.length === b.length && a.every((k, i) => k === b[i]);
 
 export interface PruneTarget {
-  item: 'model' | 'advisorModel' | 'effort';
+  item: 'model' | 'advisorModel' | 'effort' | 'autoCompactWindow';
   path: string[];
-  /** agentree 上次写入的值 */
-  recorded: string;
+  /** agentree 上次写入的值（autoCompactWindow 是数字） */
+  recorded: string | number;
   /** 给 FileChange.summary 用的说明 */
   summary: string;
 }
@@ -153,6 +156,9 @@ export function settingsPruneTargets(preset: Preset, applied: AppliedRecord | nu
   }
   if (w.advisorModel !== null && preset.advisor.model === null) {
     out.push({ item: 'advisorModel', path: ['advisorModel'], recorded: w.advisorModel, summary: '删除 advisorModel（方案没有指定 advisor，这个值是 agentree 上次写入的）' });
+  }
+  if (w.autoCompactWindow !== null && preset.main.autoCompactWindow === null) {
+    out.push({ item: 'autoCompactWindow', path: ['autoCompactWindow'], recorded: w.autoCompactWindow, summary: '删除 autoCompactWindow（方案没有指定自动压缩阈值，这个值是 agentree 上次写入的）' });
   }
   if (w.effort) {
     const old = effortPath(w.effort);
@@ -184,7 +190,8 @@ export function pruneDecisions(preset: Preset, applied: AppliedRecord | null, no
   for (const t of settingsPruneTargets(preset, applied)) {
     const n = nodeOf(t.path);
     if (!n) continue;
-    const same = n.type === 'string' && n.value === t.recorded;
+    // 类型也要一样：字符串 "500000" 和数字 500000 不算同一个值
+    const same = (typeof t.recorded === 'number' ? n.type === 'number' : n.type === 'string') && n.value === t.recorded;
     out.push({ ...t, status: same ? 'remove' : 'changed', current: describeJsonNode(n) });
   }
   return out;
@@ -201,11 +208,12 @@ export function changedSinceWriteNote(key: string, current: string): string {
  * 没 prune 的保留上次的记录
  */
 export function nextWrote(preset: Preset, applied: AppliedRecord | null, pruning: boolean): AppliedRecord['wrote'] {
-  const prev = applied?.wrote ?? { model: null, advisorModel: null, effort: null };
+  const prev = applied?.wrote ?? { model: null, advisorModel: null, effort: null, autoCompactWindow: null };
   return {
     model: preset.main.model !== null ? preset.main.model : pruning ? null : prev.model,
     advisorModel: preset.advisor.model !== null ? preset.advisor.model : pruning ? null : prev.advisorModel,
     effort: preset.main.effort !== null ? { ...mainEffortLocation(preset.main.model), value: preset.main.effort } : pruning ? null : prev.effort,
+    autoCompactWindow: preset.main.autoCompactWindow !== null ? preset.main.autoCompactWindow : pruning ? null : prev.autoCompactWindow,
   };
 }
 
@@ -298,11 +306,11 @@ export function findAgentFile(name: string, knownCwds: string[], projectCwd: str
 /**
  * 环境变量和 cc-switch 会让哪些设置失效。inv 表示计划（或方案）涉及哪些项，只对涉及的项给出提示：
  * modelKeys 为 settings.json 的 model / advisorModel，effort 为主会话或 agent 的 effort，
- * agentModel 为 agent 定义文件里的 model，advisor 为 advisorModel
+ * agentModel 为 agent 定义文件里的 model，advisor 为 advisorModel，compact 为 autoCompactWindow
  */
 export function envNotes(
   ctx: Pick<PlanContext, 'env' | 'ccSwitchDetected'>,
-  inv: { modelKeys: boolean; effort: boolean; agentModel: boolean; advisor: boolean },
+  inv: { modelKeys: boolean; effort: boolean; agentModel: boolean; advisor: boolean; compact?: boolean },
 ): PlanNote[] {
   const set = (name: string) => ctx.env.some((e) => e.name === name && e.value !== null);
   const out: PlanNote[] = [];
@@ -318,6 +326,16 @@ export function envNotes(
   if (set('CLAUDE_CODE_DISABLE_ADVISOR_TOOL') && inv.advisor) {
     out.push({ level: 'warn', message: '设置了环境变量 CLAUDE_CODE_DISABLE_ADVISOR_TOOL：advisor 被禁用，advisorModel 设置不生效' });
   }
+  if (inv.compact) {
+    if (set('DISABLE_COMPACT')) {
+      out.push({ level: 'warn', message: '设置了环境变量 DISABLE_COMPACT：所有压缩都被关闭，autoCompactWindow 设置不生效' });
+    } else if (set('DISABLE_AUTO_COMPACT')) {
+      out.push({ level: 'warn', message: '设置了环境变量 DISABLE_AUTO_COMPACT：自动压缩被关闭，autoCompactWindow 设置不生效' });
+    }
+    if (set('CLAUDE_CODE_AUTO_COMPACT_WINDOW')) {
+      out.push({ level: 'warn', message: '设置了环境变量 CLAUDE_CODE_AUTO_COMPACT_WINDOW：它会覆盖 settings.json 里的 autoCompactWindow（也盖过 /autocompact 和 --autocompact）' });
+    }
+  }
   return out;
 }
 
@@ -327,7 +345,7 @@ export class Planner {
   private errors: string[] = [];
   /** baseHash 对不上（文件在用户打开之后被改过或删掉）的文件路径 */
   private conflicts: string[] = [];
-  private touched = { mainModel: false, advisorModel: false, effort: false, agentModel: false, agentEffort: false, agents: false, newAgentDir: false };
+  private touched = { mainModel: false, advisorModel: false, effort: false, compact: false, agentModel: false, agentEffort: false, agents: false, newAgentDir: false };
   private presetApplied: PresetApplyInfo | undefined;
 
   constructor(private ctx: PlanContext) {}
@@ -394,12 +412,12 @@ export class Planner {
     }
   }
 
-  private setSetting(pathKeys: string[], value: string | null, summary: string) {
+  private setSetting(pathKeys: string[], value: string | number | null, summary: string) {
     this.editSettings(summary, (text) => {
       const doc = parseJsonDoc(text);
       if (value === null) return removeValue(doc, pathKeys, 'settings.json', pathKeys.length > 2);
       const existing = nodeAt(doc, pathKeys);
-      if (existing && existing.type === 'string' && existing.value === value) return text;
+      if (existing && (existing.type === 'string' || existing.type === 'number') && existing.value === value) return text;
       return setValue(doc, pathKeys, value);
     });
   }
@@ -448,6 +466,8 @@ export class Planner {
         return this.mainModel(a.value);
       case 'settings.advisorModel':
         return this.advisorModel(a.value);
+      case 'settings.autoCompactWindow':
+        return this.autoCompactWindow(a.value);
       case 'settings.effort':
         return this.effort(a.model, a.value);
       case 'claudeMd.rule':
@@ -482,6 +502,18 @@ export class Planner {
     const v = this.optString(value, 'advisor 模型');
     this.setSetting(['advisorModel'], v, v === null ? '删除 advisorModel（关闭 advisor）' : `把 advisorModel 设为 ${v}`);
     this.touched.advisorModel = true;
+  }
+
+  /** 自动压缩阈值：顶层 autoCompactWindow（token 数）。全局方案写用户级 settings.json，项目方案写 settings.local.json，和 model 相同 */
+  autoCompactWindow(value: unknown) {
+    if (value !== null && value !== undefined && !isValidAutoCompactWindow(value)) {
+      throw new PlanError(`自动压缩阈值必须是 ${AUTO_COMPACT_MIN} 到 ${AUTO_COMPACT_MAX} 之间的整数（token 数），现在是 ${String(value)}`);
+    }
+    const v = value === undefined ? null : value;
+    this.setSetting(['autoCompactWindow'], v, v === null ? '删除 autoCompactWindow（跟 Claude Code 默认）' : `把 autoCompactWindow 设为 ${v}（约 ${formatWindow(v)} token）`);
+    this.touched.compact = true;
+    // 自动压缩关着的话，阈值写了也没用
+    if (v !== null && this.currentSetting(['autoCompactEnabled']) === false) this.note('warn', PLAN_COMPACT_DISABLED_NOTE);
   }
 
   effort(model: unknown, value: unknown) {
@@ -714,6 +746,7 @@ export class Planner {
       }
     }
     if (preset.advisor.model) this.advisorModel(preset.advisor.model);
+    if (preset.main.autoCompactWindow !== null) this.autoCompactWindow(preset.main.autoCompactWindow);
     // prune：只移除 agentree 自己写过的 settings 键（applied.json 有记录），用户或 cc-switch 写的不动。
     // 键本来就不在（或 settings.json 不存在）时什么都不做，不会为了删除而创建文件
     // 值和 agentree 记录的不同，说明写入之后被别的程序或用户改过，同样不动
@@ -727,6 +760,7 @@ export class Planner {
         removed.push(`settings.json 的 ${t.path.join('.')}`);
         if (t.item === 'model') this.touched.mainModel = true;
         else if (t.item === 'advisorModel') this.touched.advisorModel = true;
+        else if (t.item === 'autoCompactWindow') this.touched.compact = true;
         else this.touched.effort = true;
       }
     }
@@ -852,11 +886,15 @@ export class Planner {
     if (desktopOnly && settingsChanged && this.touched.advisorModel) {
       this.note('warn', PLAN_DESKTOP_ADVISOR_NOTE);
     }
+    if (desktopOnly && settingsChanged && this.touched.compact) {
+      this.note('warn', PLAN_DESKTOP_COMPACT_NOTE);
+    }
     for (const n of envNotes(this.ctx, {
       modelKeys: settingsChanged && (this.touched.mainModel || this.touched.advisorModel),
       effort: this.touched.effort || this.touched.agentEffort,
       agentModel: this.touched.agentModel,
       advisor: this.touched.advisorModel,
+      compact: this.touched.compact,
     })) {
       this.note(n.level, n.message);
     }

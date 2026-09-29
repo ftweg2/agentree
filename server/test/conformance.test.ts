@@ -102,7 +102,7 @@ test('advisor 零调用：预设没指定 advisor 时给 info，不计入 warn/f
   assert.equal(sc(empty, { ...base, advisorCalls: 2 }).length, 0);
   assert.equal(sc(empty, { ...base, advisorModel: null }).length, 0);
   // 预设指定了主模型：主模型 ok + advisor info => match
-  const p: Preset = { ...defaultPreset(), main: { model: 'opus', effort: null } };
+  const p: Preset = { ...defaultPreset(), main: { model: 'opus', effort: null, autoCompactWindow: null } };
   const c2 = sc(p, base);
   assert.deepEqual(c2.map((c) => c.level), ['ok', 'info']);
   assert.equal(mainConformance(p, c2).verdict, 'match');
