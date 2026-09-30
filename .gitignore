@@ -3,6 +3,9 @@ node_modules/
 dist/
 target/
 desktop/src-tauri/gen/
+# 便携版：独立的编译目录（含 payload）和成品
+/desktop/src-tauri/target-portable/
+/release/
 
 # 本机数据：索引、方案、备份都在用户目录下的 .agentree，不在项目里。这里是保险
 *.db

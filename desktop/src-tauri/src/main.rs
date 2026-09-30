@@ -4,6 +4,8 @@
 mod backend;
 #[cfg(windows)]
 mod job;
+#[cfg(feature = "portable")]
+mod portable;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -65,6 +67,8 @@ struct Status {
     pid: Option<u32>,
     url: String,
     root: String,
+    /// 是否是便携版（加载页据此把"项目目录"显示成"运行环境"）
+    portable: bool,
     port: u16,
     elapsed_ms: u64,
     timeout_ms: u64,
@@ -98,6 +102,7 @@ impl AppState {
             pid: None,
             url: app_url(settings.port),
             root: settings.root.display().to_string(),
+            portable: cfg!(feature = "portable"),
             port: settings.port,
             elapsed_ms: 0,
             timeout_ms: READY_TIMEOUT.as_millis() as u64,
@@ -165,7 +170,8 @@ impl AppState {
             ));
         }
         let server_dir = self.settings.server_dir();
-        if server_dir.is_dir() && !server_dir.join("node_modules").is_dir() {
+        // 便携版的后端是单文件，没有 node_modules，不适用下面的提示
+        if !cfg!(feature = "portable") && server_dir.is_dir() && !server_dir.join("node_modules").is_dir() {
             return Some(
                 "server/node_modules 不存在，后端依赖可能还没有安装。请在项目根目录执行 npm run setup 后点击“重试”。".into(),
             );
@@ -292,6 +298,12 @@ fn run_attempt(app: AppHandle, st: Shared, gen: u64) {
         return;
     }
 
+    // 便携版：先确保内置的运行环境已经解压好
+    #[cfg(feature = "portable")]
+    if !prepare_portable_runtime(&st, gen) {
+        return;
+    }
+
     // 2. 解析启动命令
     let plan = match backend::resolve_launch(&st.settings) {
         Ok(p) => p,
@@ -382,6 +394,44 @@ fn run_attempt(app: AppHandle, st: Shared, gen: u64) {
             return;
         }
         thread::sleep(POLL_INTERVAL);
+    }
+}
+
+/// 便携版：解压（或复用）内置的运行环境。失败时设置错误状态并返回 false
+#[cfg(feature = "portable")]
+fn prepare_portable_runtime(st: &Shared, gen: u64) -> bool {
+    let dir = portable::runtime_dir();
+    if !portable::is_ready(&dir) {
+        st.set_starting(gen, &format!("正在准备运行环境（首次启动需要解压到 {}）…", dir.display()));
+    }
+    match portable::ensure_runtime() {
+        Ok(p) => {
+            if p.extracted {
+                st.logs.push(format!(
+                    "[agentree-desktop] 运行环境已解压到 {}，耗时 {} ms",
+                    p.dir.display(),
+                    p.elapsed.as_millis()
+                ));
+                // 解压的时间不算进后端启动的进度条
+                *lock(&st.attempt_started) = Instant::now();
+            }
+            // 旧版本留下的运行环境放到后台清理
+            thread::spawn(portable::cleanup_old);
+            st.is_current(gen)
+        }
+        Err(e) => {
+            st.set_error(
+                gen,
+                "无法准备运行环境",
+                e,
+                Some(format!(
+                    "请确认 {} 可以写入、磁盘至少有 150 MB 空闲，并且杀毒软件没有拦截；\
+                     也可以设置环境变量 AGENTREE_RUNTIME_DIR 指定别的解压位置。然后点击“重试”。",
+                    portable::runtime_base().display()
+                )),
+            );
+            false
+        }
     }
 }
 
@@ -578,11 +628,16 @@ fn main() {
     let settings = backend::load_settings();
     let state: Shared = Arc::new(AppState::new(settings));
 
-    let app = tauri::Builder::default()
-        // 单实例插件必须最先注册
-        .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
+    let mut builder = tauri::Builder::default();
+    // 单实例插件必须最先注册。
+    // AGENTREE_ALLOW_MULTI=1 时不注册：只用于开发测试（在已有实例开着时再起一个测试实例），
+    // 平时不要设置，否则两个实例会抢同一个端口。
+    if std::env::var("AGENTREE_ALLOW_MULTI").map(|v| v.trim() != "1").unwrap_or(true) {
+        builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             show_main(app);
-        }))
+        }));
+    }
+    let app = builder
         .plugin(
             tauri_plugin_window_state::Builder::new()
                 .with_state_flags(window_state_flags())

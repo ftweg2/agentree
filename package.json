@@ -10,7 +10,8 @@
     "start": "node scripts/run.mjs start",
     "test": "npm --prefix server test",
     "desktop:dev": "npm --prefix desktop run dev",
-    "desktop:build": "npm --prefix desktop run build"
+    "desktop:build": "npm --prefix desktop run build",
+    "portable": "node scripts/portable.mjs"
   },
   "license": "MIT",
   "repository": {

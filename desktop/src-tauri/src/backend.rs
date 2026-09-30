@@ -1,5 +1,8 @@
 //! 后端进程管理：配置解析、启动命令解析、子进程启动与结束、健康检查。
 
+// 便携版只走内置运行环境，项目目录那一套解析逻辑用不到
+#![cfg_attr(feature = "portable", allow(dead_code, unreachable_code))]
+
 use std::collections::VecDeque;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -45,6 +48,16 @@ fn env_nonempty(key: &str) -> Option<String> {
 }
 
 pub fn load_settings() -> Settings {
+    // 便携版不依赖项目目录：根目录就是解压出来的运行环境，只认 AGENTREE_PORT
+    #[cfg(feature = "portable")]
+    {
+        let port = env_nonempty("AGENTREE_PORT")
+            .and_then(|p| p.parse::<u16>().ok())
+            .filter(|p| *p != 0)
+            .unwrap_or(DEFAULT_PORT);
+        return Settings { root: crate::portable::runtime_dir(), port, server_command: None, config_warning: None };
+    }
+
     // 项目根目录：AGENTREE_ROOT 优先，否则用编译时的 CARGO_MANIFEST_DIR 往上两级
     let root = match env_nonempty("AGENTREE_ROOT") {
         Some(r) => PathBuf::from(r),
@@ -374,7 +387,35 @@ fn npm_fallback(node: Option<&Path>, source: String) -> LaunchPlan {
     }
 }
 
+/// 便携版：用解压出来的 node.exe 直接运行打包好的后端
+#[cfg(feature = "portable")]
+fn resolve_portable_launch(settings: &Settings) -> Result<LaunchPlan, LaunchError> {
+    use crate::portable;
+    let dir = &settings.root;
+    let node = portable::node_exe(dir);
+    let entry = portable::server_entry(dir);
+    if !node.is_file() || !entry.is_file() {
+        return Err(LaunchError {
+            title: "运行环境不完整".into(),
+            message: format!("{} 里缺少 node.exe 或后端文件。", dir.display()),
+            hint: Some("可能被杀毒软件或清理工具删掉了。点击“重试”会重新解压。".into()),
+        });
+    }
+    let args = vec![entry.to_string_lossy().to_string(), "--production".to_string()];
+    Ok(LaunchPlan {
+        display: display_of(&node, &args),
+        program: node.clone(),
+        args,
+        env: vec![("AGENTREE_WEB_DIST".into(), portable::web_dist(dir).to_string_lossy().to_string())],
+        source: "便携版内置的运行环境".into(),
+        node: Some(node),
+    })
+}
+
 pub fn resolve_launch(settings: &Settings) -> Result<LaunchPlan, LaunchError> {
+    #[cfg(feature = "portable")]
+    return resolve_portable_launch(settings);
+
     let server_dir = settings.server_dir();
     if !server_dir.is_dir() {
         return Err(LaunchError {

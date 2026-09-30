@@ -18,7 +18,8 @@
   function setMeta(s) {
     var rows = [];
     rows.push(['地址', s.url]);
-    rows.push(['项目目录', s.root]);
+    // 便携版没有项目目录，显示的是解压出来的运行环境
+    rows.push([s.portable ? '运行环境' : '项目目录', s.root]);
     if (s.command) rows.push(['启动命令', s.command]);
     if (s.commandSource) rows.push(['命令来源', s.commandSource]);
     if (s.pid) rows.push(['后端进程', 'PID ' + s.pid]);

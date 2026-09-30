@@ -15,7 +15,7 @@ A local desktop tool for Claude Code: build your own agent setup on a node canva
 
 | 要求 | 说明 |
 |---|---|
-| Node.js 24 或更高 | 用到了 Node 自带的 SQLite |
+| Node.js 24 或更高 | 用到了 Node 自带的 SQLite。只用构建好的便携版时不需要 |
 | Claude Code | 命令行或桌面版，用过之后才有日志可读 |
 | Windows 10 / 11 | 在 Windows 上开发和测试。macOS 和 Linux 的路径已经做了处理，但没有实际测试过 |
 | Rust | 只有构建桌面应用时需要，用浏览器打开不需要 |
@@ -41,9 +41,36 @@ npm run desktop:build
 
 构建出的程序在 `desktop/src-tauri/target/release/agentree.exe`，双击运行。点窗口的关闭按钮会隐藏到托盘，从托盘菜单选"退出"才真正退出。
 
-这个程序是一个外壳，运行时要用到项目文件夹里的 `server` 和 `web`，所以不能单独拷到别处。移动了项目文件夹之后要重新构建，或者设置环境变量 `AGENTREE_ROOT` 指向新位置。
+桌面应用有两种构建，界面和功能完全一样，区别在于运行时依赖什么：
 
-更新代码之后要退出再重新打开，新的后端才会生效。忘了重启时界面顶部会有提示。
+| | `npm run desktop:build` | `npm run portable`（便携版） |
+|---|---|---|
+| 成品 | `desktop/src-tauri/target/release/agentree.exe`，约 7 MB | `release/agentree-portable.exe`，约 33 MB |
+| 运行时需要 | 项目文件夹里的 `server` 和 `web`，以及机器上的 Node.js 24 | 只需要系统自带的 WebView2 |
+| 能不能拷到别处 | 不能。它只是外壳，移动了项目文件夹之后要重新构建，或者设置环境变量 `AGENTREE_ROOT` 指向新位置 | 能，拷到任何一台 Windows 10/11 x64 电脑上双击即用 |
+| 适合 | 开发。改了代码退出再打开就生效 | 给别人用，或者自己在没有项目代码的电脑上用 |
+
+更新代码之后要退出再重新打开，新的后端才会生效。忘了重启时界面顶部会有提示。便携版里的后端是构建时打包进去的，改了代码要重新执行 `npm run portable`。
+
+### 便携版
+
+```bash
+npm run setup
+npm --prefix desktop install
+npm run portable
+```
+
+构建需要 Node.js 24 和 Rust，而且要在 Windows x64 上执行：exe 里带的 node.exe 就是执行构建的那个 Node。脚本会构建前端、把后端打成单个文件、和 node.exe 一起压缩后嵌进 exe，最后打印成品的大小和 SHA256。编译用的是独立的 `desktop/src-tauri/target-portable` 目录，不会覆盖 `desktop:build` 的成品。第一次构建会下载 Node.js 对应版本的许可证文本，一起放进 exe。
+
+使用：
+
+- 把 `agentree-portable.exe` 拷到任意位置，双击运行，不用安装。
+- 需要 Microsoft Edge WebView2 运行时。Windows 11 自带，Windows 10 绝大多数也已经装了；没有的话启动时会弹出英文提示"Could not find the WebView2 Runtime"，到微软官网下载"常青版"安装即可。
+- 第一次启动会把内置的运行环境（node.exe、后端、前端，约 95 MB）解压到 `%LOCALAPPDATA%\agentree\runtime\<版本哈希>\`，加载页上显示"正在准备运行环境"，之后启动直接复用。换了新版本的 exe 会解压到新目录，旧目录在启动后自动清理。环境变量 `AGENTREE_RUNTIME_DIR` 可以改解压位置。
+- 数据和命令行、普通桌面版一样：agentree 自己的数据在 `~/.agentree`，读取和写入的是 Claude Code 的配置目录（默认 `~/.claude`）。便携版和普通桌面版不能同时开着（同一个端口）。
+- 彻底删除：从托盘菜单退出，然后删掉 exe、`%LOCALAPPDATA%\agentree` 和 `~/.agentree`。窗口位置记在 `%APPDATA%\com.agentree.desktop`，浏览器缓存在 `%LOCALAPPDATA%\com.agentree.desktop`，也可以一起删掉（普通桌面版也用这两个目录）。
+
+有的杀毒软件会对"从 exe 里解压出另一个 exe 并运行"的程序报警或拦截，这时要把解压目录加进白名单。
 
 ## 功能
 
@@ -191,6 +218,7 @@ npm run dev            # 开发模式，前后端都带热重载
 npm run build          # 构建前端
 npm test               # 后端单元测试
 npm run desktop:build  # 构建桌面应用
+npm run portable       # 构建便携版（单个 exe）
 ```
 
 | 目录 | 内容 |
@@ -211,6 +239,9 @@ npm run desktop:build  # 构建桌面应用
 | `AGENTREE_HOME` | agentree 数据目录，默认 `~/.agentree` |
 | `AGENTREE_ROOT` | 项目根目录。桌面应用默认记住编译时的位置，项目移动后需要设置这个变量或重新构建 |
 | `CLAUDE_CONFIG_DIR` | Claude Code 配置目录，默认 `~/.claude` |
+| `AGENTREE_RUNTIME_DIR` | 便携版解压运行环境的位置，默认 `%LOCALAPPDATA%\agentree\runtime` |
+| `AGENTREE_WEB_DIST` | 后端托管的前端目录，默认项目里的 `web/dist`。便携版会自动设置 |
+| `AGENTREE_ALLOW_MULTI` | 设为 `1` 时桌面应用不做单实例检查，只用于开发测试（在已有实例开着时起一个测试实例，要配合不同的 `AGENTREE_PORT`） |
 
 测试配置写入功能时，务必把 `CLAUDE_CONFIG_DIR` 和 `AGENTREE_HOME` 指向临时目录。
 

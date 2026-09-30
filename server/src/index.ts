@@ -14,7 +14,9 @@ import { Pricing } from './pricing.ts';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const production = process.argv.includes('--production') || process.env.NODE_ENV === 'production';
-const distDir = path.resolve(here, '..', '..', 'web', 'dist');
+// 前端构建产物的位置：默认是项目里的 web/dist；便携版把前端解压到别处，用 AGENTREE_WEB_DIST 指过来
+const webDistEnv = process.env.AGENTREE_WEB_DIST?.trim();
+const distDir = webDistEnv ? path.resolve(webDistEnv) : path.resolve(here, '..', '..', 'web', 'dist');
 const staticDir = production && existsSync(distDir) ? distDir : null;
 
 const store = new Store();
