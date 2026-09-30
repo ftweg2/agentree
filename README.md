@@ -11,6 +11,14 @@ A local desktop tool for Claude Code: build your own agent setup on a node canva
 
 只读本地日志，不装 hook，不改网络配置，不上传任何数据。命令行和桌面版的会话都支持。
 
+## 下载即用
+
+Windows 10 / 11（64 位）用户可以直接到 [Releases](https://github.com/ftweg2/agentree/releases/latest) 下载 `agentree-portable.exe`，双击运行，不用安装，也不需要 Node.js 和源码。
+
+这个 exe 没有代码签名，Windows 可能提示"未知发布者"，点"更多信息"再点"仍要运行"。发布页上有 SHA256 可以核对。
+
+下面的内容是给想从源码运行或参与开发的人看的。
+
 ## 运行要求
 
 | 要求 | 说明 |
