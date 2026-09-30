@@ -375,6 +375,48 @@
   min-width: 0;
 }
 
+/* 面板里一节下面的小段，如"允许它再派发"下面的"往下派发时指定的模型" */
+.insp-sub {
+  margin-top: 14px;
+  padding: 12px 12px 12px;
+  border-radius: var(--r);
+  background: var(--surface-2);
+}
+.insp-sub .model-input {
+  flex-direction: column;
+  gap: 6px;
+}
+.insp-sub .model-input .select,
+.insp-sub .model-input .input {
+  flex: none;
+  width: 100%;
+  min-width: 0;
+}
+.insp-sub-label {
+  display: block;
+  margin-bottom: 8px;
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+
+/* 只读地显示从主会话继承来的设置，如子 agent 面板里的自动压缩 */
+.insp-inherit {
+  display: grid;
+  grid-template-columns: 56px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  margin-top: 14px;
+}
+.insp-inherit .k {
+  color: var(--text-3);
+  font-size: 12.5px;
+}
+.insp-inherit .v {
+  min-width: 0;
+  color: var(--text-2);
+  font-size: 12.5px;
+}
+
 /* 工具 */
 .tool-presets {
   display: grid;
@@ -760,4 +802,15 @@
   stroke-dasharray: 5 6;
   pointer-events: none;
   opacity: 0.7;
+}
+
+/* 画布上有子 agent、却没把规则节点连到主会话时的提醒：不挡操作，点一下加上规则 */
+.btn.rule-hint {
+  color: var(--warn);
+  border-color: color-mix(in srgb, var(--warn) 45%, transparent);
+  white-space: nowrap;
+}
+.btn.rule-hint b {
+  font-weight: 600;
+  margin-left: 4px;
 }

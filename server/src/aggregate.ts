@@ -12,6 +12,7 @@ import type {
   LiveState,
   ModelUsage,
   Overview,
+  ReplyWaitStats,
   SessionDetail,
   SessionSummary,
   TokenTotals,
@@ -66,6 +67,13 @@ export function emptyCompactions(): CompactionStats {
   return { total: 0, auto: 0, manual: 0, autoPreTokens: [] };
 }
 
+/** 等第一段内容超过这个时长（毫秒）的回复算慢回复 */
+export const SLOW_REPLY_MS = 120_000;
+
+export function emptyReplyWait(): ReplyWaitStats {
+  return { replies: 0, slowReplies: 0, longest: null };
+}
+
 export class Analyzer {
   private cache = new Map<string, Computed>();
 
@@ -109,22 +117,33 @@ export class Analyzer {
     const { ref: scheme, preset } = this.presets.schemeFor(sess.cwd ?? null);
 
     // ---------- 文件：活跃时间与时间范围 ----------
-    const fileRows = db
-      .prepare('SELECT path, agent, mtime_ms, first_ts, last_ts, pending_tools FROM files WHERE session_id = ?')
-      .all(sid) as Array<{ path: string; agent: string; mtime_ms: number; first_ts: string | null; last_ts: string | null; pending_tools: string | null }>;
-    const fileInfo = new Map<string, { mtime: number | null; first: string | null; last: string | null; pending: boolean }>();
+    const fileRows = db.prepare('SELECT path, agent, mtime_ms, first_ts, last_ts, pending_tools FROM files WHERE session_id = ?').all(sid) as Array<{
+      path: string;
+      agent: string;
+      mtime_ms: number;
+      first_ts: string | null;
+      last_ts: string | null;
+      pending_tools: string | null;
+    }>;
+    // pending：文件末尾在等工具结果，或（只看主文件）在等模型回复；两种情况都可能长时间没有写入但会话还活着。
+    // awaiting：主文件最后一条有效记录是用户消息或工具结果、之后还没有回复时，那条记录的时间
+    const fileInfo = new Map<string, { mtime: number | null; first: string | null; last: string | null; pending: boolean; awaiting: string | null }>();
     for (const f of fileRows) {
       // 最近写入时间：文件修改时间、本进程观察到文件变大的时间、最后一条记录的时间戳，取最大
       let m = this.indexer.mtimeOf(f.path) ?? (f.mtime_ms > 0 ? f.mtime_ms : null);
       const lastRec = tsMs(f.last_ts);
       if (lastRec !== null && (m === null || lastRec > m)) m = Math.min(lastRec, now);
-      const pending = parsePending(f.pending_tools).ids.length > 0;
+      const pt = parsePending(f.pending_tools);
+      // 子 agent 被中断时它自己的文件里没有中断标记，所以"在等回复"只看主文件，免得被中断的子 agent 一直显示运行中
+      const awaiting = f.agent === 'main' && pt.ids.length === 0 ? (pt.awaiting ?? null) : null;
+      const pending = pt.ids.length > 0 || awaiting !== null;
       const prev = fileInfo.get(f.agent);
-      if (!prev) fileInfo.set(f.agent, { mtime: m, first: f.first_ts, last: f.last_ts, pending });
+      if (!prev) fileInfo.set(f.agent, { mtime: m, first: f.first_ts, last: f.last_ts, pending, awaiting });
       else {
         if (m !== null && (prev.mtime === null || m > prev.mtime)) {
           prev.mtime = m;
           prev.pending = pending;
+          prev.awaiting = awaiting;
         }
         if (f.first_ts && (!prev.first || f.first_ts < prev.first)) prev.first = f.first_ts;
         if (f.last_ts && (!prev.last || f.last_ts > prev.last)) prev.last = f.last_ts;
@@ -145,39 +164,62 @@ export class Analyzer {
          WHERE a.session_id = ? GROUP BY r.agent, a.model`,
       )
       .all(sid) as Array<{ agent: string; model: string | null; n: number; i: number; o: number; cr: number; c5: number; c1: number }>;
-    const effRows = db
-      .prepare(
-        `SELECT agent, effort, MIN(ts) AS t FROM requests WHERE session_id = ? AND effort IS NOT NULL GROUP BY agent, effort ORDER BY t`,
-      )
-      .all(sid) as Array<{ agent: string; effort: string }>;
-    const lastRows = db
-      .prepare(
-        `SELECT agent, model, effort, MAX(ts) AS t FROM requests WHERE session_id = ? AND ${COUNTED} GROUP BY agent`,
-      )
-      .all(sid) as Array<{ agent: string; model: string | null; effort: string | null; t: string | null }>;
-    const advModelRows = db
-      .prepare(
-        `SELECT agent, advisor_model, MAX(ts) AS t FROM requests WHERE session_id = ? AND advisor_model IS NOT NULL GROUP BY agent`,
-      )
-      .all(sid) as Array<{ agent: string; advisor_model: string }>;
-    const toolCountRows = db
-      .prepare(`SELECT agent, COUNT(*) AS n FROM tool_uses WHERE session_id = ? GROUP BY agent`)
-      .all(sid) as Array<{ agent: string; n: number }>;
-    const lastToolRows = db
-      .prepare(`SELECT agent, name, MAX(ts) AS t FROM tool_uses WHERE session_id = ? GROUP BY agent`)
-      .all(sid) as Array<{ agent: string; name: string }>;
-    const agentToolRows = db
-      .prepare(`SELECT * FROM tool_uses WHERE session_id = ? AND name IN ('Agent', 'Task')`)
-      .all(sid) as any[];
+    const effRows = db.prepare(`SELECT agent, effort, MIN(ts) AS t FROM requests WHERE session_id = ? AND effort IS NOT NULL GROUP BY agent, effort ORDER BY t`).all(sid) as Array<{
+      agent: string;
+      effort: string;
+    }>;
+    const lastRows = db.prepare(`SELECT agent, model, effort, MAX(ts) AS t FROM requests WHERE session_id = ? AND ${COUNTED} GROUP BY agent`).all(sid) as Array<{
+      agent: string;
+      model: string | null;
+      effort: string | null;
+      t: string | null;
+    }>;
+    const advModelRows = db.prepare(`SELECT agent, advisor_model, MAX(ts) AS t FROM requests WHERE session_id = ? AND advisor_model IS NOT NULL GROUP BY agent`).all(sid) as Array<{
+      agent: string;
+      advisor_model: string;
+    }>;
+    const toolCountRows = db.prepare(`SELECT agent, COUNT(*) AS n FROM tool_uses WHERE session_id = ? GROUP BY agent`).all(sid) as Array<{ agent: string; n: number }>;
+    const lastToolRows = db.prepare(`SELECT agent, name, MAX(ts) AS t FROM tool_uses WHERE session_id = ? GROUP BY agent`).all(sid) as Array<{ agent: string; name: string }>;
+    const agentToolRows = db.prepare(`SELECT * FROM tool_uses WHERE session_id = ? AND name IN ('Agent', 'Task')`).all(sid) as any[];
     const resultRows = db.prepare(`SELECT * FROM agent_results WHERE session_id = ?`).all(sid) as any[];
-    const notifRows = db
-      .prepare(`SELECT task_id, status, MAX(ts) AS ts FROM notifications WHERE session_id = ? GROUP BY task_id, status`)
-      .all(sid) as Array<{ task_id: string; status: string; ts: string | null }>;
+    const notifRows = db.prepare(`SELECT task_id, status, MAX(ts) AS ts FROM notifications WHERE session_id = ? GROUP BY task_id, status`).all(sid) as Array<{
+      task_id: string;
+      status: string;
+      ts: string | null;
+    }>;
     const metaRows = db.prepare(`SELECT * FROM agent_meta WHERE session_id = ?`).all(sid) as any[];
     // 上下文压缩：按 agent 分开统计，自动压缩的 preTokens 按时间顺序
-    const compactRows = db
-      .prepare(`SELECT agent, trigger, pre_tokens FROM compactions WHERE session_id = ? ORDER BY ts IS NULL, ts, key`)
-      .all(sid) as Array<{ agent: string; trigger: string; pre_tokens: number | null }>;
+    const compactRows = db.prepare(`SELECT agent, trigger, pre_tokens FROM compactions WHERE session_id = ? ORDER BY ts IS NULL, ts, key`).all(sid) as Array<{
+      agent: string;
+      trigger: string;
+      pre_tokens: number | null;
+    }>;
+    // 回复等待：每次回复里最长的一段没有输出的时间（起点到第一块、相邻两块之间的最大间隔）。<synthetic> 不是模型的回复，不算
+    const waitRows = db
+      .prepare(
+        `SELECT agent, ts, prompt_ts, end_ts, max_gap_ms, gap_ts, output FROM requests
+         WHERE session_id = ? AND max_gap_ms IS NOT NULL AND (model IS NULL OR model <> '<synthetic>')`,
+      )
+      .all(sid) as Array<{ agent: string; ts: string | null; prompt_ts: string | null; end_ts: string | null; max_gap_ms: number; gap_ts: string | null; output: number }>;
+    const replyWaits = new Map<string, ReplyWaitStats>();
+    for (const r of waitRows) {
+      const gap = r.max_gap_ms;
+      const at = r.gap_ts ?? r.ts;
+      if (gap < 0 || !at) continue;
+      const p = tsMs(r.prompt_ts);
+      const end = tsMs(r.end_ts);
+      const w = replyWaits.get(r.agent) ?? emptyReplyWait();
+      w.replies++;
+      if (gap > SLOW_REPLY_MS) w.slowReplies++;
+      if (!w.longest || gap > w.longest.waitMs) {
+        w.longest = { waitMs: gap, durationMs: p !== null && end !== null && end >= p ? end - p : null, outputTokens: r.output, at };
+      }
+      replyWaits.set(r.agent, w);
+    }
+    // 中断：次数，和中断前最长等了多久
+    const intRow = db.prepare(`SELECT COUNT(*) AS n, MAX(wait_ms) AS w FROM interrupts WHERE session_id = ? AND agent = 'main'`).get(sid) as { n: number; w: number | null };
+    const interruptCount = intRow.n;
+    const interruptMaxWaitMs = intRow.w ?? null;
     const compactions = new Map<string, CompactionStats>();
     for (const r of compactRows) {
       const c = compactions.get(r.agent) ?? emptyCompactions();
@@ -354,6 +396,7 @@ export class Analyzer {
         advisorModel: advModel.get('main') ?? null,
         advisorCalls: advisorCalls.get('main') ?? 0,
         compactions: compactions.get('main') ?? emptyCompactions(),
+        replyWait: replyWaits.get('main') ?? emptyReplyWait(),
         conformance: { verdict: 'not-checked', presetAgent: null, checks: [] },
         children: [],
       });
@@ -397,7 +440,7 @@ export class Analyzer {
       if (duration !== null && duration < 0) duration = 0;
 
       const agentType = meta?.agentType ?? res?.agentType ?? tu?.subagentType ?? null;
-      const background = res ? res.isAsync : meta?.requestShape ? meta.requestShape === 'background' : tu?.background ?? false;
+      const background = res ? res.isAsync : meta?.requestShape ? meta.requestShape === 'background' : (tu?.background ?? false);
 
       nodes.set(id, {
         id,
@@ -424,6 +467,7 @@ export class Analyzer {
         advisorModel: advModel.get(id) ?? null,
         advisorCalls: advisorCalls.get(id) ?? 0,
         compactions: compactions.get(id) ?? emptyCompactions(),
+        replyWait: replyWaits.get(id) ?? emptyReplyWait(),
         conformance: { verdict: 'not-checked', presetAgent: null, checks: [] },
         children: [],
       });
@@ -508,6 +552,9 @@ export class Analyzer {
           models: node.models.filter((m) => m.requests > 0).map((m) => m.model),
           primaryModel: node.primaryModel,
           efforts: node.efforts,
+          // 父 agent 在方案里指定了往下派发的模型时，核对这次派发传的 model 参数
+          parentAgentType: node.parentId ? (nodes.get(node.parentId)?.agentType ?? null) : null,
+          requestedModel: node.requestedModel,
         },
         main.primaryModel,
       );
@@ -525,11 +572,14 @@ export class Analyzer {
     walk('main', seen);
     for (const id of nodes.keys()) if (!seen.has(id)) walk(id, seen); // 理论上不会发生
 
-    const sessionModels = mergeModelUsages(ordered.map((n) => n.models), this.costOf);
+    const sessionModels = mergeModelUsages(
+      ordered.map((n) => n.models),
+      this.costOf,
+    );
     const typeMap = new Map<string, { spawns: number; requests: number; tokens: TokenTotals; lists: ModelUsage[][] }>();
     const types = new Map<string, string>();
     for (const n of ordered) {
-      const t = n.kind === 'main' ? 'main' : n.agentType ?? 'unknown';
+      const t = n.kind === 'main' ? 'main' : (n.agentType ?? 'unknown');
       types.set(n.id, t);
       const e = typeMap.get(t) ?? { spawns: 0, requests: 0, tokens: zeroTokens(), lists: [] };
       e.spawns += 1;
@@ -549,13 +599,7 @@ export class Analyzer {
     const allChecks: ConformanceCheck[] = [...sChecks];
     for (const n of ordered) if (n.kind === 'subagent') allChecks.push(...n.conformance.checks);
     const verdicts = ordered.map((n) => n.conformance.verdict);
-    const verdict: ConformanceVerdict = verdicts.includes('mismatch')
-      ? 'mismatch'
-      : verdicts.includes('unplanned')
-        ? 'unplanned'
-        : verdicts.includes('match')
-          ? 'match'
-          : 'not-checked';
+    const verdict: ConformanceVerdict = verdicts.includes('mismatch') ? 'mismatch' : verdicts.includes('unplanned') ? 'unplanned' : verdicts.includes('match') ? 'match' : 'not-checked';
 
     let startedAt: string | null = null;
     let lastActivity: string | null = null;
@@ -570,6 +614,12 @@ export class Analyzer {
       const m = new Date(lastMtime).toISOString();
       if (!lastActivity || m > lastActivity) lastActivity = m;
     }
+    // 正在等回复：主文件在等，且最后写入在 30 分钟内（和等长时间工具结果的判定相同）
+    const awaitingMs = tsMs(mainInfo?.awaiting ?? null);
+    const awaitingReply =
+      mainInfo?.awaiting && awaitingMs !== null && isLive({ now, lastWriteMs: mainInfo.mtime, pendingTool: true })
+        ? { since: mainInfo.awaiting, waitedMs: Math.max(0, now - awaitingMs) }
+        : null;
     const ds = this.desktop.sessions.get(sid);
     const title = ds?.title ?? sess.custom_title ?? sess.ai_title ?? sess.first_prompt ?? null;
 
@@ -593,6 +643,10 @@ export class Analyzer {
       advisorModel: main.advisorModel,
       advisorCalls: totalAdvisorCalls,
       compactions: main.compactions,
+      replyWait: main.replyWait,
+      interrupts: interruptCount,
+      interruptMaxWaitMs,
+      awaitingReply,
       agentCount: ordered.length - 1,
       maxDepth,
       requests: ordered.reduce((s, n) => s + n.requests, 0),
@@ -812,11 +866,13 @@ export class Analyzer {
         lastActivityAt: d.summary.lastActivityAt,
         mainActive,
         mainModel: mainExtra?.lastModel ?? d.summary.mainModel,
-        mainTool: mainActive ? (mainExtra?.currentTool ?? null) : null,
+        // 在等模型回复时，最近一次的工具已经结束了，不显示
+        mainTool: mainActive && !d.summary.awaitingReply ? (mainExtra?.currentTool ?? null) : null,
         requests: d.summary.requests,
         tokens: d.summary.tokens.total,
         agentCount: d.summary.agentCount,
         runningAgents,
+        awaitingReply: d.summary.awaitingReply,
       });
     }
     sessions.sort((a, b) => (b.lastActivityAt ?? '').localeCompare(a.lastActivityAt ?? ''));

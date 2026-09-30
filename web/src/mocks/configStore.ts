@@ -21,6 +21,8 @@ import type {
 } from '../types';
 import { ApiFailure } from '../api/client';
 import { BUILTIN_TYPES } from './conformance';
+import { parseDispatch, withDispatch } from '../../../shared/dispatch';
+import { defaultRuleText } from '../../../shared/rule';
 
 export const CONFIG_DIR = 'C:\\Users\\you\\.claude';
 const SETTINGS = `${CONFIG_DIR}\\settings.json`;
@@ -176,6 +178,23 @@ function parseAgent(content: string, filePath: string): ParsedAgent | { error: s
   return { fm: lines.slice(1, end), rest: lines.slice(end + 1).join('\n') };
 }
 
+/** 定义文件正文末尾 agentree 写的派发块里的模型；文件不存在或没有块时为 null */
+export function dispatchModelOf(filePath: string): string | null {
+  const f = getFile(filePath);
+  if (!f) return null;
+  const parsed = parseAgent(f.content, filePath);
+  return parseDispatch('rest' in parsed ? parsed.rest : f.content).model;
+}
+
+/** 按方案里的 dispatchModel 改正文：undefined 不动，null 删块，字符串写块。rest 是 frontmatter 之后的全部内容 */
+function restWithDispatch(rest: string, model: string | null | undefined): string {
+  if (model === undefined) return rest;
+  // 要删块但本来就没有块：不动，免得只因空行不同而改文件
+  if (model === null && parseDispatch(rest).model === null) return rest;
+  const body = rest.replace(/^\n/, '').replace(/\n+$/, '');
+  return `\n${withDispatch(body, model)}\n`;
+}
+
 /** 找到某个顶层键的行范围（含多行值的续行） */
 function keyRange(fm: string[], k: string): [number, number] | null {
   const i = fm.findIndex((l) => new RegExp(`^${k}\\s*:`).test(l));
@@ -242,7 +261,7 @@ function templateFor(name: string): { description: string; tools: string | null;
       };
     case 'worker':
       return {
-        description: '按明确的要求修改代码并运行测试',
+        description: '需要新建或修改文件、写代码、跑测试时使用。主会话把要求和验收标准写清楚后交给它',
         tools: null,
         body: '- 只改任务要求的范围\n- 改完运行相关测试\n- 如实报告测试结果，失败就说失败',
       };
@@ -336,7 +355,8 @@ export function agentDetail(filePath: string): AgentDefinitionDetail {
   };
 }
 
-export function ruleState(): ClaudeMdRuleState {
+/** preset 是模拟后端保存的方案：默认文字按它生成，方案为空时用 advisor 三条（和真实后端一致） */
+export function ruleState(preset?: Preset): ClaudeMdRuleState {
   const f = getFile(CLAUDE_MD);
   const c = f?.content ?? '';
   const s = c.indexOf(START);
@@ -354,7 +374,7 @@ export function ruleState(): ClaudeMdRuleState {
     fileExists: !!f,
     enabled,
     text: enabled ? c.slice(s + START.length, e).replace(/^\n/, '').replace(/\n$/, '') : null,
-    defaultText: DEFAULT_RULE,
+    defaultText: (preset ? defaultRuleText(preset) : '') || DEFAULT_RULE,
   };
 }
 
@@ -367,19 +387,32 @@ export function breakRuleForDemo() {
 export function templates(): PresetTemplate[] {
   return [
     {
-      id: 'opus-main-fable-advisor',
-      name: 'Opus 5.5 主力 + Fable 5.1 顾问',
-      description:
-        '主会话用 Opus 5.5 高强度运行，三个子 agent 分别负责读代码、改代码、查文档，用 Opus 5.5 中等强度；Fable 5.1 作为顾问，在关键节点给建议',
+      id: 'fable-main-opus-agents',
+      name: 'Fable 5.1 统筹 + Opus 5.5 干活',
+      description: '主会话用 Fable 5.1 拆任务和验收，三个 Opus 5.5 子 agent 分别读代码、改代码、查资料，可以同时跑。适合能拆开的大任务。不设顾问。',
       preset: {
         version: 1,
-        main: { model: 'claude-opus-5-5', effort: 'high', autoCompactWindow: null },
-        advisor: { model: 'fable' },
+        main: { model: 'claude-fable-5-1', effort: 'high', autoCompactWindow: null },
+        advisor: { model: null },
         agents: [
           { name: 'explorer', model: 'opus', effort: 'medium', note: '读代码' },
           { name: 'worker', model: 'opus', effort: 'medium', note: '改代码' },
           { name: 'researcher', model: 'opus', effort: 'medium', note: '查文档' },
         ],
+        allowBuiltins: true,
+        updatedAt: null,
+      },
+      includeRule: true,
+    },
+    {
+      id: 'opus-main-fable-advisor',
+      name: 'Opus 5.5 主力 + Fable 5.1 顾问',
+      description: '主会话用 Opus 5.5 自己干活，在关键节点咨询 Fable 5.1。不带子 agent，单线进行。适合普通的单线任务，比上一种省。',
+      preset: {
+        version: 1,
+        main: { model: 'claude-opus-5-5', effort: 'high', autoCompactWindow: null },
+        advisor: { model: 'fable' },
+        agents: [],
         allowBuiltins: true,
         updatedAt: null,
       },
@@ -513,7 +546,7 @@ function rule(d: Draft, enabled: boolean, text: string | null) {
     if (head === '\n' && tail === '') after = '';
   }
   if (after === before) return;
-  d.set(CLAUDE_MD, after, enabled ? (starts ? '更新 advisor 规则块的内容' : '在末尾追加 advisor 规则块，原有内容不变') : '删除 advisor 规则块，原有内容不变');
+  d.set(CLAUDE_MD, after, enabled ? (starts ? '更新 agentree 规则块的内容' : '在末尾追加 agentree 规则块，原有内容不变') : '删除 agentree 规则块，原有内容不变');
 }
 
 function agentUpsert(d: Draft, a: Extract<ConfigAction, { type: 'agent.upsert' }>) {
@@ -592,7 +625,7 @@ function agentUpsert(d: Draft, a: Extract<ConfigAction, { type: 'agent.upsert' }
   d.note('info', '定义文件修改后几秒内生效；如果 agents 目录是这次新建的，需要重启会话才能识别。');
 }
 
-function presetApply(d: Draft, p: Preset, includeRule: boolean) {
+function presetApply(d: Draft, p: Preset, includeRule: boolean, ruleText?: string | null) {
   if (p.main.model) setTop(d, 'model', p.main.model, 'model');
   if (p.main.effort) {
     const m = p.main.model;
@@ -613,7 +646,8 @@ function presetApply(d: Draft, p: Preset, includeRule: boolean) {
     const cur = d.current(path);
     if (cur == null) {
       const tpl = templateFor(a.name);
-      d.set(path, buildAgent(a.name, { description: tpl.description || `${a.name}（请补充描述）`, model: a.model, effort: a.effort, tools: tpl.tools }, tpl.body), `新建 agent 定义 ${a.name}（用模板）`);
+      const body = a.dispatchModel ? withDispatch(tpl.body, a.dispatchModel) : tpl.body;
+      d.set(path, buildAgent(a.name, { description: tpl.description || `${a.name}（请补充描述）`, model: a.model, effort: a.effort, tools: tpl.tools }, body), `新建 agent 定义 ${a.name}（用模板）`);
     } else {
       const parsed = parseAgent(cur, path);
       if ('error' in parsed) {
@@ -630,11 +664,21 @@ function presetApply(d: Draft, p: Preset, includeRule: boolean) {
         ch.push(`effort 从 ${readValue(fm, 'effort') ?? '未设置'} 改为 ${a.effort}`);
         fm = setKey(fm, 'effort', a.effort);
       }
-      if (ch.length) d.set(path, `---\n${fm.join('\n')}\n---\n${parsed.rest}`, ch.join('，'));
+      const rest = restWithDispatch(parsed.rest, a.dispatchModel);
+      if (rest !== parsed.rest) {
+        const was = parseDispatch(parsed.rest).model;
+        ch.push(a.dispatchModel ? `往下派发的模型从 ${was ?? '未指定'} 改为 ${a.dispatchModel}` : `去掉往下派发的模型 ${was}`);
+      }
+      if (ch.length) d.set(path, `---\n${fm.join('\n')}\n---\n${rest}`, ch.join('，'));
     }
     d.note('info', '定义文件修改后几秒内生效；如果 agents 目录是这次新建的，需要重启会话才能识别。');
   }
-  if (includeRule) rule(d, true, null);
+  if (includeRule) {
+    // 没给自定义文字时按方案生成；生成的为空（没有子 agent 也没有 advisor）时不写规则块，已有的删掉
+    const text = ruleText?.trim() ? ruleText : defaultRuleText(p);
+    if (text) rule(d, true, text);
+    else rule(d, false, null);
+  }
 }
 
 function finish(d: Draft): ChangePlan {
@@ -705,7 +749,7 @@ export function makePlan(actions: ConfigAction[], envWarnings: PlanNote[]): Chan
         rule(d, a.enabled, a.text);
         break;
       case 'preset.apply':
-        presetApply(d, a.preset, a.includeRule);
+        presetApply(d, a.preset, a.includeRule, a.ruleText);
         break;
     }
   }

@@ -6,6 +6,7 @@ import os from 'node:os';
 import path from 'node:path';
 import type { AgentDefinition, CheckLevel, ClaudeConfigSnapshot, EnvCheck, Preset, PresetAgent } from '../../shared/types.ts';
 import { BUILTIN_AGENT_TYPES, claudeConfigDirs, isValidAutoCompactWindow } from './config.ts';
+import { parseDispatch } from '../../shared/dispatch.ts';
 import { parseAgentDoc, promptOf, type AgentDoc } from './config/frontmatter.ts';
 import { readTextFile } from './config/text.ts';
 
@@ -166,10 +167,7 @@ function regQuery(key: string): Promise<Map<string, string>> {
 let regCache: { at: number; user: Map<string, string>; machine: Map<string, string> } | null = null;
 async function registryEnv() {
   if (regCache && Date.now() - regCache.at < 10_000) return regCache;
-  const [user, machine] = await Promise.all([
-    regQuery('HKCU\\Environment'),
-    regQuery('HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment'),
-  ]);
+  const [user, machine] = await Promise.all([regQuery('HKCU\\Environment'), regQuery('HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment')]);
   regCache = { at: Date.now(), user, machine };
   return regCache;
 }
@@ -217,9 +215,7 @@ export async function configSnapshot(projectCwds: string[]): Promise<ClaudeConfi
   const modelEffort = modelEffortOf(settings);
   const envObj = settings.env && typeof settings.env === 'object' ? (settings.env as Record<string, unknown>) : {};
   const { checks, rawBaseUrls } = await envChecks(envObj);
-  const ccSwitchDetected =
-    existsSync(path.join(os.homedir(), '.cc-switch', 'live-state.json')) ||
-    rawBaseUrls.some((u) => /(127\.0\.0\.1|localhost):15721/i.test(u));
+  const ccSwitchDetected = existsSync(path.join(os.homedir(), '.cc-switch', 'live-state.json')) || rawBaseUrls.some((u) => /(127\.0\.0\.1|localhost):15721/i.test(u));
   return {
     configDir,
     definitions,
@@ -319,7 +315,10 @@ function presetAgentsFrom(definitions: AgentDefinition[]): PresetAgent[] {
     const doc = readAgentDoc(d.filePath);
     if (doc) {
       pa.disallowedTools = doc.fields.find((f) => f.key === 'disallowedTools')?.value?.trim() || null;
-      pa.prompt = promptOf(doc);
+      // 正文末尾 agentree 的派发块拆出来放在 dispatchModel，prompt 里不含它；没有块为 null（原样提交时应用不会加块）
+      const parsed = parseDispatch(promptOf(doc));
+      pa.prompt = parsed.prompt;
+      pa.dispatchModel = parsed.model;
     }
     byName.set(d.name, pa);
   }

@@ -1,9 +1,11 @@
 // "只用一次"：生成一条只对那一次会话生效的命令行启动命令（PowerShell 写法）。
 // 纯函数，前端的搭建页和后端的测试都用它。不写任何文件。
+import { withDispatch } from './dispatch.js';
 import type { Preset } from './types.js';
 
 /**
  * 命令带上画布上的子 agent（--agents）、主模型（--model）、effort（--effort）和自动压缩阈值（--autocompact）。
+ * 子 agent 的 prompt 带上往下派发的块（shared/dispatch.ts），和应用时写进定义文件的正文一致。
  * isBuiltin 判断名字是不是内置类型：内置类型没有定义文件，不放进 --agents
  */
 export function launchCommand(p: Preset, cwd: string | null, isBuiltin: (name: string) => boolean): string {
@@ -15,7 +17,7 @@ export function launchCommand(p: Preset, cwd: string | null, isBuiltin: (name: s
   const agents: Record<string, Record<string, unknown>> = {};
   for (const a of p.agents) {
     if (isBuiltin(a.name)) continue;
-    const def: Record<string, unknown> = { description: a.description ?? a.note ?? a.name, prompt: a.prompt ?? '' };
+    const def: Record<string, unknown> = { description: a.description ?? a.note ?? a.name, prompt: withDispatch(a.prompt ?? '', a.dispatchModel ?? null) };
     if (a.tools) def.tools = list(a.tools);
     if (a.disallowedTools) def.disallowedTools = list(a.disallowedTools);
     if (a.model) def.model = a.model;

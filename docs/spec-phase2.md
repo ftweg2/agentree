@@ -220,16 +220,17 @@ tools: Read, Grep, Glob
 
 ### 方案模板
 
-`GET /api/config/templates` 返回内置模板。第一版只有一个：
+`GET /api/config/templates` 返回内置模板。现在是互不叠加的两套（早期只有一个把两者叠在一起的模板，真实试用下来太慢：子 agent 会继承顾问设置，主会话和每个子 agent 各咨询一次）：
 
-| 字段 | 值 |
-|---|---|
-| id | `opus-main-fable-advisor` |
-| 名称 | Opus 5.5 主力 + Fable 5.1 顾问 |
-| 说明 | 主会话用 Opus 5.5 高强度运行，三个子 agent 分别负责读代码、改代码、查文档，用 Opus 5.5 中等强度；Fable 5.1 作为顾问，在关键节点给建议 |
-| main | model `claude-opus-5-5`，effort `high` |
-| advisor | model `fable` |
-| agents | `explorer`、`worker`、`researcher`，都是 model `opus`、effort `medium` |
+| | 第一套 | 第二套 |
+|---|---|---|
+| id | `fable-main-opus-agents` | `opus-main-fable-advisor` |
+| 名称 | Fable 5.1 统筹 + Opus 5.5 干活 | Opus 5.5 主力 + Fable 5.1 顾问 |
+| main | model `claude-fable-5-1`，effort `high` | model `claude-opus-5-5`，effort `high` |
+| advisor | 不设（Fable 主会话只接受 Fable 当顾问） | model `fable` |
+| agents | `explorer`、`worker`、`researcher`，都是 model `opus`、effort `medium` | 没有 |
+| 规则块 | 只有"怎么分工" | 只有"何时咨询 advisor" |
+| 适合 | 能拆开的大任务，子 agent 可以同时跑 | 普通的单线任务，更省 |
 | allowBuiltins | true |
 | includeRule | true |
 
@@ -315,3 +316,25 @@ tools: Read, Grep, Glob
 | 只用一次 | 启动命令加 `--autocompact <token 数>` |
 
 桌面版是否读取 `autoCompactWindow` 尚未验证：写入按有效处理，由生效检查揭示真相。
+
+阈值是整个会话共用的：官方文档写压缩设置 "Applies to both main conversations and subagents"，定义文件的 frontmatter 没有任何压缩字段，所以不能给单个子 agent 单独设。生效检查的样本因此包含每个会话里全部子 agent 自己对话的自动压缩（`AgentNode.compactions`），不只是主对话；有子 agent 的样本时结论里会说明其中几次发生在子 agent 里。
+
+## 第二阶段补充：往下派发的模型
+
+子 agent 上多一项 `dispatchModel`：它再往下派发子 agent 时，要给 Agent 工具传的 `model` 参数（别名或完整模型 ID）。
+
+依据（官方文档 `sub-agents.md`、`env-vars.md`）：
+
+- 子 agent 的模型按这个顺序决定：派发时传的 `model` 参数 > 定义里的 `model`（`inherit` 指主会话的模型）> `CLAUDE_CODE_SUBAGENT_MODEL` > 主会话的模型。
+- 内置的 Explore、Plan、general-purpose 在子 agent 下面跑时用的是主会话的模型（Explore 最高到 Opus），不是父 agent 的。
+- frontmatter 里 `tools: Agent(a, b)` 这种类型列表只在 `claude --agent` 作为主线程时有效，写在子 agent 定义里会被忽略；没有任何字段能规定"下一层用什么模型"。
+
+所以唯一能左右下一层模型的是派发时的 `model` 参数，agentree 把这个要求写进子 agent 的系统提示词：
+
+| 步骤 | 做法 |
+|---|---|
+| 写 | 定义文件正文末尾一段受管的块（`shared/dispatch.ts`），用 `<!-- agentree:dispatch-model:start model=... -->` 和 `<!-- agentree:dispatch-model:end -->` 包起来。`dispatchModel` 缺失不动已有的块，`null` 删掉块，字符串写成这个模型。按文件原有的换行风格写。读回（从配置生成方案）时把块拆出来，`prompt` 不含块。这个 agent 不能再派发（`disallowedTools` 含 Agent，或 `tools` 白名单不含 Agent）时照写，但给一条提示 |
+| 验 | 生效检查单独一项 `agent:<name>:dispatch`：written 看块里的模型；observed 看起点之后它作为父节点派发出去的子节点，派发时实际传的 `model`（别名和同系列的完整 ID 互相算匹配，没传记作"没指定"）。会话页上，被它派发的每个节点多一条 `dispatch` 检查，不符合只给 warn |
+| 只用一次 | `--agents` 里的 `prompt` 同样带上这个块 |
+
+边界：这是给模型的提示，不是硬性限制，模型可能不照做（用户在任务里明确要求别的模型时，块里的文字也让它以用户为准）。所以不符合时只提醒、不判为违反方案，结论里也照实说"模型不一定照做"。

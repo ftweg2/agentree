@@ -32,7 +32,8 @@ export type AgentStatus = 'running' | 'completed' | 'failed' | 'stopped' | 'unkn
 export type CheckLevel = 'ok' | 'warn' | 'fail' | 'info';
 
 export interface ConformanceCheck {
-  field: 'agent' | 'model' | 'effort' | 'advisor';
+  /** dispatch：这个节点是被一个指定了 dispatchModel 的父 agent 派发的，比的是派发时实际传的 model 参数 */
+  field: 'agent' | 'model' | 'effort' | 'advisor' | 'dispatch';
   level: CheckLevel;
   expected: string | null;
   actual: string | null;
@@ -66,6 +67,38 @@ export interface CompactionStats {
   manual: number;
   /** 自动压缩时的 preTokens，按时间顺序；记录上没有 preTokens 的不在这里 */
   autoPreTokens: number[];
+}
+
+/**
+ * 回复等待的统计。一次回复的每个内容块各写一条记录，时间戳是块完成的时间，所以思考完成之前日志里什么都没有。
+ * "没有输出的时间"取这次回复里最长的一段沉默：之前最近的一条用户记录（用户消息、工具结果）到第一块、
+ * 以及同一次回复里相邻两块之间的最大间隔。长思考常常不在开头（比如先调用 advisor，拿到结果后再思考 6 分钟），
+ * 所以不能只看第一块。高强度（xhigh、max）下模型会先思考很久，这段时间界面上没有任何输出
+ */
+export interface ReplyWaitStats {
+  /** 能算出沉默时间的回复次数 */
+  replies: number;
+  /** 最长一段没有输出的时间超过 2 分钟的回复次数 */
+  slowReplies: number;
+  /** 沉默最久的一次回复；没有能算的回复时为 null */
+  longest: {
+    /** 这次回复里最长一段没有输出的时间，毫秒 */
+    waitMs: number;
+    /** 整次回复的耗时（起点到最后一块完成），毫秒 */
+    durationMs: number | null;
+    /** 这次回复的输出 token */
+    outputTokens: number;
+    /** 这段沉默结束的时间（结束它的那一块完成的时间） */
+    at: string;
+  } | null;
+}
+
+/** 正在等模型回复：最后一条有效记录是用户消息或工具结果，之后还没有回复 */
+export interface AwaitingReply {
+  /** 开始等的时间（那条用户记录的时间） */
+  since: string;
+  /** 到后端计算时已经等了多久，毫秒 */
+  waitedMs: number;
 }
 
 export interface AgentNode {
@@ -117,6 +150,8 @@ export interface AgentNode {
   advisorCalls: number;
   /** 这个 agent 自己的对话被压缩的次数（主会话是主对话，子 agent 是它自己的对话），不含后代 */
   compactions: CompactionStats;
+  /** 这个 agent 自己的回复等待统计，不含后代 */
+  replyWait: ReplyWaitStats;
   conformance: Conformance;
   /** 子节点 id，按开始时间排序 */
   children: string[];
@@ -155,6 +190,17 @@ export interface SessionSummary {
   advisorCalls: number;
   /** 主对话被压缩的次数（不含子 agent 自己的对话；每个 agent 自己的见 AgentNode.compactions） */
   compactions: CompactionStats;
+  /** 主对话的回复等待统计（不含子 agent；每个 agent 自己的见 AgentNode.replyWait） */
+  replyWait: ReplyWaitStats;
+  /** 主对话被用户中断的次数（日志里 [Request interrupted by user...] 标记的条数） */
+  interrupts: number;
+  /**
+   * 主对话里中断前最长等了多久（毫秒）：每个中断标记的时间减去它之前最近的一条记录（用户消息、工具结果或回复块）的时间，取最大。
+   * 用户消息之后一直没有输出、等到被中断的那段时间只在这里体现。没有中断或算不出时为 null
+   */
+  interruptMaxWaitMs: number | null;
+  /** 主对话正在等回复时的信息；没在等，或会话最近 30 分钟没有写入时为 null */
+  awaitingReply: AwaitingReply | null;
   /** 子 agent 数量，不含主会话 */
   agentCount: number;
   maxDepth: number;
@@ -276,6 +322,8 @@ export interface LiveSession {
   /** 这个会话一共派发过多少子 agent，包括已经结束的 */
   agentCount: number;
   runningAgents: LiveAgent[];
+  /** 主会话正在等回复时的信息（模型可能在思考），否则为 null */
+  awaitingReply: AwaitingReply | null;
 }
 
 export interface LiveState {
@@ -305,8 +353,21 @@ export interface PresetAgent {
   tools?: string | null;
   /** 工具黑名单，逗号分隔。常见用法是 "Agent"：禁止它再往下派发子 agent */
   disallowedTools?: string | null;
-  /** 系统提示词，即定义文件的正文 */
+  /** 系统提示词，即定义文件的正文。不含 agentree 写在正文末尾的"往下派发"块（见 shared/dispatch.ts），那一块由 dispatchModel 表示 */
   prompt?: string;
+  /**
+   * 它往下派发子 agent 时要传给 Agent 工具的 model 参数：别名（opus、sonnet、haiku、fable）或完整模型 ID。
+   * Claude Code 没有这样的 frontmatter 字段，唯一能左右下一层模型的是派发时的 model 参数（官方解析顺序里排第一），
+   * 所以应用时把这个要求写进定义文件正文末尾一段受管的块（shared/dispatch.ts）。这是给模型的提示，不是硬性限制，
+   * 会话页和生效检查按日志核对它每次派发实际传的模型。
+   * 没有这个要求时，下一层的模型按 Claude Code 的规则：有定义文件的 agent 用自己定义里的 model；
+   * Explore、Plan、general-purpose 这类内置类型用主会话的模型（Explore 最高到 Opus），不是父 agent 的。
+   *   字段缺失（undefined）：不管这一项，应用时不动正文里已有的块
+   *   null：明确不要，应用时把正文里的块删掉
+   *   字符串：应用时写成这个值
+   * 只有允许它再派发（tools 含 Agent 或没限制，且 disallowedTools 不含 Agent）时才有意义
+   */
+  dispatchModel?: string | null;
 }
 
 /**
@@ -347,6 +408,8 @@ export interface Preset {
     effort: string | null;
     /**
      * 自动压缩阈值：上下文达到这么多 token 时 Claude Code 自动压缩对话，对应 settings 的 autoCompactWindow。
+     * 主对话和全部子 agent 共用这一个阈值：官方文档写压缩设置 "Applies to both main conversations and subagents"，
+     * 定义文件的 frontmatter 没有任何压缩相关字段，所以不能给单个子 agent 单独设。生效检查也要把子 agent 里的自动压缩算进来。
      * 取值 100000 到 1000000 的整数，实际生效的上限是模型的上下文窗口（200K 的模型到 200K 就压缩）。
      * null 表示不指定，跟 Claude Code 默认。磁盘上的旧方案没有这个字段，读入时当作 null
      */
@@ -497,7 +560,7 @@ export type ConfigAction =
   | {
       type: 'claudeMd.rule';
       enabled: boolean;
-      /** 规则正文；null 表示用默认文案 */
+      /** 规则正文；null 表示用默认文字：按已保存的全局方案生成，方案为空时用 advisor 三条 */
       text: string | null;
     }
   | {
@@ -507,7 +570,10 @@ export type ConfigAction =
       projectCwd?: string | null;
       /** 是否同时写入 CLAUDE.md 规则 */
       includeRule: boolean;
-      /** 规则文案。缺失或 null：已有规则块时保持原文案，没有时用默认文案 */
+      /**
+       * 规则文字。缺失或 null：用按方案生成的文字（shared/rule.ts 的 defaultRuleText，项目方案叠加已保存的全局方案），
+       * 已有规则块且文字不同时替换；生成的文字为空（方案里既没有子 agent 也没有 advisor）时不写规则块，已有的删除
+       */
       ruleText?: string | null;
       /**
        * 为 true 时，把 agentree 以前写进去、现在方案里已经没有的东西移除：
@@ -606,6 +672,7 @@ export interface ClaudeMdRuleState {
   enabled: boolean;
   /** 当前规则块里的正文；没有则为 null */
   text: string | null;
+  /** 按已保存的方案生成的默认文字（项目叠加全局方案）；方案里既没有子 agent 也没有 advisor 时是兜底的 advisor 三条 */
   defaultText: string;
   /** 标记损坏（不成对或重复）时的说明；正常为 null。不为 null 时界面应禁用开关并提示用户手动处理 */
   error: string | null;
@@ -615,7 +682,7 @@ export interface ClaudeMdRuleState {
  * 生效检查：回答"搭好的方案写进去了吗、实际运行时用上了吗"。
  * 每一项分两步判断：written（配置文件里是不是这个值）和 observed（之后的实际运行里是不是这个值）。
  */
-export type EffectKind = 'main-model' | 'main-effort' | 'main-compact' | 'advisor' | 'rule' | 'agent';
+export type EffectKind = 'main-model' | 'main-effort' | 'main-compact' | 'advisor' | 'rule' | 'agent' | 'agent-dispatch';
 
 export interface EffectWritten {
   /**
@@ -674,7 +741,7 @@ export interface EffectObserved {
 }
 
 export interface EffectItem {
-  /** 'main.model'、'main.effort'、'main.compact'、'advisor'、'rule'、'agent:<name>' */
+  /** 'main.model'、'main.effort'、'main.compact'、'advisor'、'rule'、'agent:<name>'、'agent:<name>:dispatch'（它往下派发时指定的模型） */
   key: string;
   kind: EffectKind;
   /** agent 的名字；其他为 null */

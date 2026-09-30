@@ -19,7 +19,7 @@ const AGENT_TEMPLATES: Array<{ name: string } & Omit<AgentTemplate, 'placeholder
     name: 'explorer',
     label: '读代码',
     description:
-      '只读地查找和阅读代码。需要弄清楚"某段逻辑在哪里""某个功能是怎么实现的""改这里会影响哪些地方"时使用。涉及多个文件的查找都应该交给它，主动使用。',
+      '只读地查找和阅读代码。需要弄清楚"某段逻辑在哪里""某个功能是怎么实现的""改这里会影响哪些地方"时使用；涉及多个文件的查找都交给它，主动使用。',
     tools: 'Read, Grep, Glob',
     disallowedTools: null,
     prompt: [
@@ -42,11 +42,11 @@ const AGENT_TEMPLATES: Array<{ name: string } & Omit<AgentTemplate, 'placeholder
   {
     name: 'worker',
     label: '改代码、跑测试',
-    description: '按明确的要求修改代码并运行测试。任务的范围和做法已经确定、需要动手改文件时使用。',
+    description: '需要新建或修改文件、写代码、跑测试时使用。主会话把要求和验收标准写清楚后交给它，主动使用。',
     tools: null,
     disallowedTools: null,
     prompt: [
-      '你是代码修改员，负责按主会话给出的明确要求修改代码，并用测试确认改对了。',
+      '你是代码修改员，负责按主会话给出的要求新建或修改代码，并用测试确认改对了。',
       '',
       '## 工作方式',
       '- 动手前先读相关代码，弄清楚现有的写法和约定，改动要和周围的代码风格一致',
@@ -65,7 +65,7 @@ const AGENT_TEMPLATES: Array<{ name: string } & Omit<AgentTemplate, 'placeholder
   {
     name: 'researcher',
     label: '查文档',
-    description: '查阅官方文档和网上资料，回答技术问题。需要确认某个库、接口、工具的用法或版本差异时使用。',
+    description: '查阅官方文档和网上资料，回答技术问题。需要确认某个库、接口、工具的用法、版本差异或最新变化时使用，主动使用。',
     tools: 'Read, Grep, Glob, WebFetch, WebSearch',
     disallowedTools: null,
     prompt: [
@@ -127,16 +127,32 @@ function templateAgent(name: string, model: string | null, effort: string | null
 }
 
 export const PRESET_TEMPLATES: PresetTemplate[] = [
+  // 两套互不叠加的组合。早期只有一个"Opus 主力 + Fable 顾问 + 三个子 agent"的模板，真实试用下来太重：
+  // 子 agent 会继承顾问设置，主会话和每个子 agent 各自去咨询一次，再加上高强度思考，一个任务要等十几分钟。
+  {
+    id: 'fable-main-opus-agents',
+    name: 'Fable 5.1 统筹 + Opus 5.5 干活',
+    description: '主会话用 Fable 5.1 拆任务和验收，三个 Opus 5.5 子 agent 分别读代码、改代码、查资料，可以同时跑。适合能拆开的大任务。不设顾问。',
+    preset: {
+      version: 1,
+      main: { model: 'claude-fable-5-1', effort: 'high', autoCompactWindow: null },
+      // Fable 主会话只接受 Fable 当顾问（官方文档的配对表），设了也没有意义
+      advisor: { model: null },
+      agents: [templateAgent('explorer', 'opus', 'medium'), templateAgent('worker', 'opus', 'medium'), templateAgent('researcher', 'opus', 'medium')],
+      allowBuiltins: true,
+      updatedAt: null,
+    },
+    includeRule: true,
+  },
   {
     id: 'opus-main-fable-advisor',
     name: 'Opus 5.5 主力 + Fable 5.1 顾问',
-    description:
-      '主会话用 Opus 5.5 高强度运行，三个子 agent 分别负责读代码、改代码、查文档，用 Opus 5.5 中等强度；Fable 5.1 作为顾问，在关键节点给建议',
+    description: '主会话用 Opus 5.5 自己干活，在关键节点咨询 Fable 5.1。不带子 agent，单线进行。适合普通的单线任务，比上一种省。',
     preset: {
       version: 1,
       main: { model: 'claude-opus-5-5', effort: 'high', autoCompactWindow: null },
       advisor: { model: 'fable' },
-      agents: [templateAgent('explorer', 'opus', 'medium'), templateAgent('worker', 'opus', 'medium'), templateAgent('researcher', 'opus', 'medium')],
+      agents: [],
       allowBuiltins: true,
       updatedAt: null,
     },

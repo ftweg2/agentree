@@ -8,6 +8,7 @@ import type {
   CompactionStats,
   ModelUsage,
   Preset,
+  ReplyWaitStats,
   SessionDetail,
   SessionSummary,
   TokenTotals,
@@ -102,6 +103,8 @@ interface NodeSpec {
   advisorCalls?: number;
   /** 上下文压缩：自动压缩前的 token 数列表、手动压缩次数 */
   compactions?: { autoPreTokens: number[]; manual?: number };
+  /** 回复等待：最长一次等了多少秒、那次的输出 token、超过 2 分钟的次数。省略时按节点生成几十秒以内的值 */
+  wait?: { longestSec: number; out: number; slow: number };
   /** 相对会话开始的分钟数 */
   start: number;
   /** 持续分钟数；运行中的节点省略 */
@@ -121,6 +124,12 @@ interface SessionSpec {
   startedMinAgo: number;
   /** 是否活跃（运行中的节点会随时间增长） */
   active: boolean;
+  /** 主对话被用户中断的次数 */
+  interrupts?: number;
+  /** 中断前最长等了多少秒 */
+  interruptMaxWaitSec?: number;
+  /** 主对话正在等回复：从模块加载时刻往前推多少分钟开始等 */
+  awaitingMin?: number;
   root: NodeSpec;
 }
 
@@ -135,6 +144,8 @@ const LIVE_ROOT: NodeSpec = {
   advisorCalls: 0,
   // 在阈值 500K 附近自动压缩过一次
   compactions: { autoPreTokens: [498_300] },
+  // xhigh 下有一次先思考了 6 分钟才出第一段内容
+  wait: { longestSec: 368, out: 43_616, slow: 3 },
   start: 0,
   tools: 142,
   children: [
@@ -148,6 +159,7 @@ const LIVE_ROOT: NodeSpec = {
       models: [[OPUS_OLD, 22]],
       efforts: E('high'),
       requestedModel: 'opus',
+      wait: { longestSec: 151, out: 12_400, slow: 1 },
       start: 4,
       dur: 11,
       tools: 38,
@@ -283,6 +295,9 @@ const SESSIONS: SessionSpec[] = [
     version: '2.1.263',
     startedMinAgo: 25,
     active: true,
+    interrupts: 3,
+    // 用户消息之后 11 分钟没有任何输出，被中断
+    interruptMaxWaitSec: 662,
     root: LIVE_ROOT,
   },
   {
@@ -294,6 +309,7 @@ const SESSIONS: SessionSpec[] = [
     version: '2.1.263',
     startedMinAgo: 14,
     active: true,
+    awaitingMin: 4,
     root: {
       id: 'main',
       status: 'running',
@@ -487,6 +503,14 @@ export function currentToolFor(id: string): string {
   return TOOLS[i];
 }
 
+function replyWaitOf(ns: NodeSpec, requests: number, startedAt: string): ReplyWaitStats {
+  if (requests === 0) return { replies: 0, slowReplies: 0, longest: null };
+  const w = ns.wait ?? { longestSec: 4 + Math.round(seeded(ns.id + 'w') * 40), out: 800 + Math.round(seeded(ns.id + 'o') * 6000), slow: 0 };
+  const waitMs = w.longestSec * 1000;
+  const at = new Date(new Date(startedAt).getTime() + 60_000 + waitMs).toISOString();
+  return { replies: requests, slowReplies: w.slow, longest: { waitMs, durationMs: waitMs + 40_000, outputTokens: w.out, at } };
+}
+
 function compactionsOf(ns: NodeSpec): CompactionStats {
   const auto = ns.compactions?.autoPreTokens ?? [];
   const manual = ns.compactions?.manual ?? 0;
@@ -536,6 +560,7 @@ export function buildSession(spec: SessionSpec, preset: Preset, t0: number): Ses
       advisorModel: ns.advisorModel ?? null,
       advisorCalls: ns.advisorCalls ?? 0,
       compactions: compactionsOf(ns),
+      replyWait: replyWaitOf(ns, requests, started),
       conformance: { verdict: 'not-checked', presetAgent: null, checks: [] },
       children: [],
     };
@@ -629,6 +654,13 @@ export function buildSession(spec: SessionSpec, preset: Preset, t0: number): Ses
     advisorModel: main.advisorModel,
     advisorCalls: main.advisorCalls,
     compactions: main.compactions,
+    replyWait: main.replyWait,
+    interrupts: spec.interrupts ?? 0,
+    interruptMaxWaitMs: spec.interruptMaxWaitSec != null ? spec.interruptMaxWaitSec * 1000 : null,
+    awaitingReply:
+      spec.awaitingMin != null
+        ? { since: new Date(t0 - spec.awaitingMin * 60_000).toISOString(), waitedMs: now - (t0 - spec.awaitingMin * 60_000) }
+        : null,
     agentCount: ordered.length - 1,
     maxDepth: Math.max(...ordered.map((a) => a.depth)),
     requests: main.subtree.requests,
@@ -662,7 +694,8 @@ export const DEFAULT_MOCK_PRESET: Preset = {
     { name: 'code-reviewer', model: 'sonnet', effort: 'high', note: '只读审查，不改代码' },
     // 用完整 ID：一致性检查结果不变，但"应用到 Claude Code"时会去改只读的 test-runner.md，用来演示部分失败
     { name: 'test-runner', model: 'claude-haiku-4-5', effort: 'medium' },
-    { name: 'researcher', model: OPUS, effort: 'high', note: '需要读长文档' },
+    // 往下派发时指定 haiku：researcher.md 里还没有派发块，生效检查里这一项是"还没写入"
+    { name: 'researcher', model: OPUS, effort: 'high', note: '需要读长文档', dispatchModel: 'haiku' },
     { name: 'doc-writer', model: 'fable', effort: null },
   ],
   allowBuiltins: true,

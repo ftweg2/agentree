@@ -116,3 +116,12 @@ export function projectLabel(projectDir: string, cwd: string | null | undefined)
   const parts = projectDir.split('-').filter(Boolean);
   return parts.length ? parts[parts.length - 1] : projectDir;
 }
+
+/** 正在等回复的整分钟数（向下取整）；没在等或还不到 1 分钟时为 null，界面只在等了 1 分钟以上时提示 */
+export function awaitingMinutes(since: string | null | undefined, now: number = Date.now()): number | null {
+  if (!since) return null;
+  const t = new Date(since).getTime();
+  if (Number.isNaN(t)) return null;
+  const m = Math.floor((now - t) / 60_000);
+  return m >= 1 ? m : null;
+}

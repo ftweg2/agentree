@@ -298,15 +298,16 @@ test('applied.json：旧格式的布尔值当作不知道值（null），prune �
 test('prune：includeRule 为 false 时删除规则块（不看 applied.json）；prune 为 false 时保留', async () => {
   const orig = '# 我的规则\n';
   fs.writeFileSync(claudeMdPath, orig);
-  const on = plan(preset(), { includeRule: true });
+  // 空方案生成的默认文字为空、不写规则块，这里给一段自定义文字
+  const on = plan(preset(), { includeRule: true, ruleText: '规则' });
   await applyPlan(on, []);
   assert.match(fs.readFileSync(claudeMdPath, 'utf8'), /agentree:advisor-rule:start/);
   assert.equal(plan(preset(), { includeRule: false, prune: false }).plan.changes.length, 0);
   const off = plan(preset(), { includeRule: false, prune: true });
   const c = changeOf(off, 'CLAUDE.md')!;
   assert.equal(c.after, orig, '删除后与启用前逐字节相同');
-  assert.match(c.summary, /删除 advisor 规则块/);
-  assert.ok(off.plan.notes.some((n) => n.message === '这次会移除：CLAUDE.md 里的 advisor 规则块'));
+  assert.match(c.summary, /删除 agentree 规则块/);
+  assert.ok(off.plan.notes.some((n) => n.message === '这次会移除：CLAUDE.md 里的 agentree 规则块'));
   // 没有规则块、CLAUDE.md 不存在：不创建
   fs.rmSync(claudeMdPath);
   assert.equal(plan(preset(), { includeRule: false, prune: true }).plan.changes.length, 0);
@@ -388,7 +389,7 @@ test('prune 缺失或 false：行为和原来一样，只增改不移除', () =>
 
 // ---------------- ruleText ----------------
 
-test('ruleText：自定义文案写入；已有规则块文案不同则替换；相同不改；缺失时不动已有的', async () => {
+test('ruleText：自定义文案原样写入；已有规则块文案不同则替换；相同不改', async () => {
   const p = plan(preset(), { includeRule: true, ruleText: '规则一' });
   assert.match(changeOf(p, 'CLAUDE.md')!.after!, /start -->\n规则一\n<!--/);
   await applyPlan(p, []);
@@ -396,8 +397,114 @@ test('ruleText：自定义文案写入；已有规则块文案不同则替换；
   const q = plan(preset(), { includeRule: true, ruleText: '规则二' });
   assert.match(changeOf(q, 'CLAUDE.md')!.after!, /start -->\n规则二\n<!--/);
   assert.match(changeOf(q, 'CLAUDE.md')!.summary, /替换/);
-  assert.equal(plan(preset(), { includeRule: true, ruleText: null }).plan.changes.length, 0, 'null：已有规则块保持原文案');
-  assert.equal(plan(preset(), { includeRule: true }).plan.changes.length, 0, '缺失：同上');
+  // 多行、带 Markdown 的自定义文字原样写进标记之间
+  const multi = '## 我的规则\n\n- 第一条\n- 第二条';
+  assert.ok(changeOf(plan(preset(), { includeRule: true, ruleText: multi }), 'CLAUDE.md')!.after!.includes(`start -->\n${multi}\n<!--`));
+});
+
+// ---------------- 按方案生成的默认规则 ----------------
+
+const { defaultRuleText } = await import('../../shared/rule.ts');
+const { findRuleBlock } = await import('../src/config/claudeMd.ts');
+const { effectReport } = await import('../src/effect.ts');
+const { Store } = await import('../src/db.ts');
+const { Analyzer } = await import('../src/aggregate.ts');
+const { Indexer } = await import('../src/indexer.ts');
+const { Pricing } = await import('../src/pricing.ts');
+const { Desktop } = await import('../src/desktop.ts');
+const { PresetStore } = await import('../src/preset.ts');
+
+/** 早先版本写进 CLAUDE.md 的块：只有 advisor 三条 */
+const OLD_BLOCK = [
+  '<!-- agentree:advisor-rule:start -->',
+  '## 何时咨询 advisor',
+  '',
+  '- 动手做一个大的计划之前，先问 advisor 这个方向对不对',
+  '- 同一个错误第二次出现时，问 advisor 是不是走错了路',
+  '- 宣布一个耗时长的任务完成之前，问 advisor 有没有遗漏',
+  '<!-- agentree:advisor-rule:end -->',
+].join('\n');
+const TEAM = preset({
+  advisor: { model: 'fable' },
+  agents: [
+    { name: 'explorer', model: null, effort: null, description: agentTemplate('explorer').description, prompt: '读代码。\n' },
+    { name: 'worker', model: null, effort: null, description: agentTemplate('worker').description, prompt: '改代码。\n' },
+  ],
+});
+const blockText = () => findRuleBlock(fs.readFileSync(claudeMdPath, 'utf8'))!.text;
+
+/** 生效检查里的规则项（全局方案）。每次用完就关掉数据库，临时目录才能删掉 */
+const ruleEffect = (p: unknown, ruleText: string | null = null) => {
+  fs.mkdirSync(path.join(root, 'home'), { recursive: true });
+  const store = new Store(path.join(root, 'home', 'fields.db'));
+  try {
+    const analyzer = new Analyzer(store, new Indexer(store), new Pricing(), new Desktop(), new PresetStore());
+    const rep = effectReport({ preset: p, includeRule: true, ruleText }, { store, analyzer, ctx: ctx() });
+    return rep.items.find((i) => i.key === 'rule')!;
+  } finally {
+    store.close();
+  }
+};
+
+test('默认规则：应用后 CLAUDE.md 里是按方案生成的文字（含分工和 advisor）；再生成计划没有变化；增加子 agent 后跟着变', async () => {
+  const p = plan(TEAM, { includeRule: true });
+  assert.equal(changeOf(p, 'CLAUDE.md')!.kind, 'create');
+  await applyPlan(p, []);
+  const want = defaultRuleText(validatePreset(TEAM));
+  assert.equal(blockText(), want);
+  assert.match(want, /## 怎么分工/);
+  assert.match(want, /`explorer`/);
+  assert.match(want, /## 何时咨询 advisor/);
+  assert.equal(plan(TEAM, { includeRule: true }).plan.changes.length, 0, '已一致');
+  assert.equal(ruleEffect(TEAM).written.state, 'yes');
+  // 画布上加了一个子 agent：默认文字跟着变，已写入的块变成 differs，应用时替换
+  const more = { ...TEAM, agents: [...TEAM.agents, { name: 'researcher', model: null, effort: null, description: '查资料时使用。' }] };
+  assert.equal(ruleEffect(more).written.state, 'differs');
+  const q = plan(more, { includeRule: true });
+  assert.match(changeOf(q, 'CLAUDE.md')!.after!, /`researcher`：查资料时使用。/);
+  assert.match(changeOf(q, 'CLAUDE.md')!.summary, /替换/);
+});
+
+test('默认规则：旧版本写的只有 advisor 三条的块判为 differs（缺少分工规则），重新应用后 yes', async () => {
+  fs.writeFileSync(claudeMdPath, `# 我的规则\n\n${OLD_BLOCK}\n`);
+  const before = ruleEffect(TEAM);
+  assert.equal(before.written.state, 'differs');
+  assert.deepEqual(before.written.diffs, ['缺少分工规则']);
+  assert.match(before.summary, /没有分工规则/);
+  assert.equal(before.nextStep !== null, true);
+  // 方案里只有 advisor 时，旧块就是生成的文字
+  assert.equal(ruleEffect(preset({ advisor: { model: 'fable' } })).written.state, 'yes');
+  const p = plan(TEAM, { includeRule: true });
+  const c = changeOf(p, 'CLAUDE.md')!;
+  assert.ok(c.after!.startsWith('# 我的规则\n\n<!-- agentree:advisor-rule:start -->\n## 怎么分工\n'), '标记不变，标记之外的内容不动');
+  await applyPlan(p, []);
+  assert.equal(ruleEffect(TEAM).written.state, 'yes');
+  // 自定义文字：和文件里的块比
+  assert.equal(ruleEffect(TEAM, '别的').written.state, 'differs');
+  assert.deepEqual(ruleEffect(TEAM, '别的').written.diffs, ['规则文字']);
+  assert.equal(ruleEffect(TEAM, '别的').expected, '有规则块（自定义文字）');
+});
+
+test('默认规则：方案里既没有子 agent 也没有 advisor 时不写规则块，已有的删除', async () => {
+  assert.equal(plan(preset(), { includeRule: true }).plan.changes.length, 0, '没有 CLAUDE.md：不创建');
+  assert.equal(ruleEffect(preset()).written.state, 'n/a');
+  fs.writeFileSync(claudeMdPath, `# 我的规则\n\n${OLD_BLOCK}\n`);
+  assert.equal(ruleEffect(preset()).written.state, 'extra');
+  const p = plan(preset(), { includeRule: true });
+  assert.equal(changeOf(p, 'CLAUDE.md')!.after, '# 我的规则\n');
+  assert.ok(p.plan.notes.some((n) => /这次会移除：CLAUDE.md 里的 agentree 规则块/.test(n.message)));
+});
+
+test('默认规则：项目方案的规则按叠加已保存的全局方案之后的子 agent 生成', () => {
+  const projDir = path.join(root, 'proj-rule');
+  fs.mkdirSync(projDir, { recursive: true });
+  const global = validatePreset(preset({ agents: [{ name: 'researcher', model: null, effort: null, description: '查资料时使用。' }] }));
+  const proj = preset({ agents: [{ name: 'worker', model: null, effort: null, description: '改代码时使用。', prompt: '改代码。\n' }] });
+  const p = makePlan([{ type: 'preset.apply', preset: proj as any, projectCwd: projDir, includeRule: true }], { ...ctx(), knownCwds: [projDir], globalPreset: () => global });
+  assert.equal(p.plan.blocked, false, p.plan.errors.join());
+  const md = p.plan.changes.find((c) => path.basename(c.filePath) === 'CLAUDE.md')!;
+  assert.ok(md.after!.includes(defaultRuleText(validatePreset(proj), global)));
+  assert.match(md.after!, /`worker`[\s\S]*`researcher`/, '项目的在前，全局的在后');
 });
 
 // ---------------- JSON 删除键 ----------------

@@ -7,7 +7,8 @@ import { configSnapshot } from './claudeConfig.ts';
 import { claudeConfigDirs } from './config.ts';
 import { applyPlan, PlanStore } from './config/applier.ts';
 import { listBackups } from './config/backups.ts';
-import { DEFAULT_RULE_TEXT, findRuleBlock, RuleBlockError } from './config/claudeMd.ts';
+import { defaultRuleText } from '../../shared/rule.ts';
+import { FALLBACK_RULE_TEXT, findRuleBlock, RuleBlockError } from './config/claudeMd.ts';
 import { FrontmatterError, getField, parseAgentDoc, promptOf } from './config/frontmatter.ts';
 import { checkWritable, isConfigDirProject, isKnownProjectCwd, PathError, projectClaudeMdPath } from './config/paths.ts';
 import { makePlan, makeRestorePlan, type PlanContext } from './config/planner.ts';
@@ -75,6 +76,7 @@ export function registerConfigRoutes(app: Hono, getKnownCwds: () => string[], pl
       applied,
       desktopOnly,
       projectApplied: (cwd: string) => deps.presets?.getApplied(cwd) ?? null,
+      globalPreset: () => deps.presets?.get() ?? null,
     };
   };
 
@@ -119,12 +121,14 @@ export function registerConfigRoutes(app: Hono, getKnownCwds: () => string[], pl
     if ('error' in p) return c.json(err(p.error), 400);
     const filePath = p.cwd === null ? path.join(claudeConfigDirs()[0], 'CLAUDE.md') : projectClaudeMdPath(p.cwd);
     const f = readTextFile(filePath);
+    // 默认文字按已保存的方案生成：项目方案叠加全局方案；方案为空时用兜底的 advisor 三条（和 claudeMd.rule 不带正文时写入的一致）
+    const auto = deps.presets ? (p.cwd === null ? defaultRuleText(deps.presets.get()) : defaultRuleText(deps.presets.get(p.cwd), deps.presets.get())) : '';
     const state: ClaudeMdRuleState = {
       filePath,
       fileExists: f.exists,
       enabled: false,
       text: null,
-      defaultText: DEFAULT_RULE_TEXT,
+      defaultText: auto || FALLBACK_RULE_TEXT,
       error: null,
     };
     if (f.exists && f.text === null) {

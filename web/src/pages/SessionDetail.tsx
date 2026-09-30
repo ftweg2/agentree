@@ -2,16 +2,19 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useParams, useSearchParams } from 'react-router-dom';
 import type { AgentNode, SessionDetail } from '../types';
 import { api } from '../api/client';
-import { useApi, useLocalState } from '../lib/useApi';
+import { useApi, useLocalState, useNow } from '../lib/useApi';
 import { useThumb } from '../lib/motion';
-import { formatDateTime, formatDuration, fullNumber, projectLabel, shortNumber } from '../lib/format';
-import { Cost, EffortTag, Empty, ErrorBox, ModelTag, Num, Skeleton, StatusBadge, Tok, VerdictBadge, VerdictMark } from '../components/ui';
+import { awaitingMinutes, formatDateTime, formatDuration, formatFullDateTime, fullNumber, projectLabel, shortNumber } from '../lib/format';
+import { Cost, EffortTag, Empty, ErrorBox, LevelBadge, ModelTag, Num, Skeleton, StatusBadge, Tok, VerdictBadge, VerdictMark } from '../components/ui';
 import { AgentTypeTable, ChecksList, ModelUsageTable } from '../components/tables';
 import TreeCanvas, { type Orientation } from '../components/tree/TreeCanvas';
 import NodeDetail from '../components/tree/NodeDetail';
 import { ancestors, buildIndex, hasWarn, nodeLabel, type UsageMode } from '../components/tree/treeModel';
 
 type Tab = 'tree' | 'table' | 'checks';
+
+/** 等第一段内容超过这个时长（毫秒）算长等待，和后端的 SLOW_REPLY_MS 一致 */
+const LONG_WAIT_MS = 120_000;
 
 function loadCollapsed(id: string): Set<string> {
   try {
@@ -29,9 +32,11 @@ export default function SessionDetailPage() {
   const fetcher = useCallback(() => api.session(id), [id]);
   const [active, setActive] = useState(false);
   const q = useApi<SessionDetail>(`session:${id}`, fetcher, active ? 2000 : null);
+  const now = useNow(10_000);
 
   useEffect(() => {
-    if (q.data) setActive(q.data.summary.isActive);
+    // 在等模型回复时可能很久没有写入，也要继续刷新
+    if (q.data) setActive(q.data.summary.isActive || !!q.data.summary.awaitingReply);
   }, [q.data]);
 
   const [tab, setTab] = useLocalState<Tab>('agentree.sessionTab', 'tree');
@@ -166,9 +171,26 @@ export default function SessionDetailPage() {
     ...detail.sessionChecks.filter((c) => c.level !== 'ok').map((c) => ({ node: index.root!, check: c })),
     ...detail.agents.filter((a) => a.kind !== 'main').flatMap((a) => a.conformance.checks.filter((c) => c.level === 'fail' || c.level === 'warn').map((c) => ({ node: a, check: c }))),
   ];
+  // 回复等待的提示：只是说明，不是检查项，不影响和预设对比的结论
+  const longest = s.replyWait?.longest ?? null;
+  const hints: string[] = [];
+  const intWait = s.interruptMaxWaitMs ?? null;
+  const longReply = !!longest && longest.waitMs > LONG_WAIT_MS;
+  const longInterrupt = s.interrupts > 0 && intWait !== null && intWait > LONG_WAIT_MS;
+  if (longReply || longInterrupt) {
+    let t = '';
+    if (longReply) t += `有一次回复中间有 ${formatDuration(longest!.waitMs)}没有任何输出，这次回复输出 ${shortNumber(longest!.outputTokens)} token。`;
+    t += '高强度（xhigh、max）下模型会先思考很久，思考完成之前界面上没有任何输出，这不是卡死。嫌慢可以在发送框旁边把强度调低。';
+    if (s.interrupts > 0) {
+      t += `这个会话被中断了 ${s.interrupts} 次${intWait !== null ? `，中断前最长等了 ${formatDuration(intWait)}` : ''}，可能有几次只是还没思考完。`;
+    }
+    hints.push(t);
+  }
+  const awaitMin = awaitingMinutes(s.awaitingReply?.since, now);
   const nFail = issues.filter((i) => i.check.level === 'fail').length;
   const nWarn = issues.filter((i) => i.check.level === 'warn').length;
-  const nInfo = issues.filter((i) => i.check.level === 'info').length;
+  const nInfo = issues.filter((i) => i.check.level === 'info').length + hints.length;
+  const nIssues = issues.length + hints.length;
 
   return (
     <div className="fill">
@@ -180,7 +202,12 @@ export default function SessionDetailPage() {
           <h1 className="ellipsis" title={s.title ?? ''}>
             {s.title ?? <span className="muted">（无标题会话）</span>}
           </h1>
-          {s.isActive ? (
+          {awaitMin !== null ? (
+            <span className="badge running" title="最后一条是用户消息或工具结果，模型还没有回复。高强度下模型会先思考很久，思考完成之前日志里没有任何输出">
+              <span className="dot running" style={{ width: 6, height: 6 }} />
+              已等待回复 {awaitMin} 分钟
+            </span>
+          ) : s.isActive ? (
             <span className="badge running" title="最近有写入，每 2 秒自动刷新">
               <span className="dot running" style={{ width: 6, height: 6 }} />
               进行中
@@ -260,6 +287,23 @@ export default function SessionDetailPage() {
               </>
             )}
           </span>
+          {longest && (
+            <span
+              className="fact"
+              title={`主对话里最长的一段没有输出：${formatDuration(longest.waitMs)}，到 ${formatFullDateTime(longest.at)} 才有下一块内容${
+                longest.durationMs !== null ? `，整次回复用了 ${formatDuration(longest.durationMs)}` : ''
+              }，输出 ${fullNumber(longest.outputTokens)} token。共 ${s.replyWait.replies} 次回复，其中 ${s.replyWait.slowReplies} 次有超过 2 分钟没有输出`}
+            >
+              最长一段没有输出 <b>{formatDuration(longest.waitMs)}</b>
+              <span className="dim">输出 {shortNumber(longest.outputTokens)} token</span>
+            </span>
+          )}
+          {s.interrupts > 0 && (
+            <span className="fact" title="主对话里用户按中断的次数；最长等了多久是中断前最后一条记录（用户消息、工具结果或回复内容）到按中断之间的时间">
+              被中断 <b>{s.interrupts} 次</b>
+              {intWait !== null && <span className="dim">最长等了 {formatDuration(intWait)}</span>}
+            </span>
+          )}
           <span className="fact">
             请求{' '}
             <b>
@@ -297,7 +341,7 @@ export default function SessionDetailPage() {
           </button>
           <button role="tab" aria-selected={tab === 'checks'} className={tab === 'checks' ? 'on' : ''} onClick={() => setTab('checks')}>
             检查
-            {issues.length > 0 && <span className={`n ${nFail ? 'fail' : nWarn ? 'warn' : ''}`}>{issues.length}</span>}
+            {nIssues > 0 && <span className={`n ${nFail ? 'fail' : nWarn ? 'warn' : ''}`}>{nIssues}</span>}
           </button>
         </div>
       </header>
@@ -374,7 +418,7 @@ export default function SessionDetailPage() {
                 <div className="card-h">
                   <h2>需要留意的项</h2>
                   <span className="small muted">
-                    {issues.length === 0 ? '没有' : [nFail && `${nFail} 项不符`, nWarn && `${nWarn} 项注意`, nInfo && `${nInfo} 项提示`].filter(Boolean).join('，')}
+                    {nIssues === 0 ? '没有' : [nFail && `${nFail} 项不符`, nWarn && `${nWarn} 项注意`, nInfo && `${nInfo} 项提示`].filter(Boolean).join('，')}
                   </span>
                   <span className="spacer" />
                   <Link to="/preset" className="small">
@@ -382,12 +426,26 @@ export default function SessionDetailPage() {
                   </Link>
                 </div>
                 <div className="card-b">
-                  {issues.length === 0 ? (
-                    <div className="small muted">
-                      {s.conformance.verdict === 'not-checked'
-                        ? '还没有设置预设，所以没有可以对比的期望值。到搭建页搭一棵期望的 agent 树并保存，之后每个会话都会和它对比。'
-                        : '实际运行和预设一致。'}
+                  {hints.map((h, i) => (
+                    <div key={`hint${i}`} className="check-item" style={{ borderLeft: '3px solid var(--info)', marginBottom: 14 }}>
+                      <div className="row">
+                        <b style={{ fontSize: 12 }}>回复等待</b>
+                        <span className="spacer" />
+                        <LevelBadge level="info" />
+                      </div>
+                      <div className="msg" style={{ marginTop: 6 }}>
+                        {h}
+                      </div>
                     </div>
+                  ))}
+                  {issues.length === 0 ? (
+                    hints.length > 0 ? null : (
+                      <div className="small muted">
+                        {s.conformance.verdict === 'not-checked'
+                          ? '还没有设置预设，所以没有可以对比的期望值。到搭建页搭一棵期望的 agent 树并保存，之后每个会话都会和它对比。'
+                          : '实际运行和预设一致。'}
+                      </div>
+                    )
                   ) : (
                     issues.map((it, i) => (
                       <div key={i} style={{ marginBottom: 14 }}>

@@ -5,7 +5,7 @@ import path from 'node:path';
 import { agentreeHome } from './config.ts';
 import type { LineBatch } from './parser.ts';
 
-export const SCHEMA_VERSION = 5;
+export const SCHEMA_VERSION = 6;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS files (
@@ -53,6 +53,13 @@ CREATE TABLE IF NOT EXISTS requests (
   cw5m INTEGER NOT NULL DEFAULT 0,
   cw1h INTEGER NOT NULL DEFAULT 0,
   advisor_calls INTEGER NOT NULL DEFAULT 0,
+  -- 回复计时（v6）：prompt_ts 是这次回复第一块之前最近的一条用户记录或上一次回复的时间，end_ts 是最后一块完成的时间。
+  -- end_ts - prompt_ts 是整次回复的耗时。max_gap_ms 是这次回复里最长的一段没有输出的时间（起点到第一块、相邻两块之间的最大间隔），
+  -- gap_ts 是结束这段沉默的那一块的时间
+  prompt_ts TEXT,
+  end_ts TEXT,
+  max_gap_ms INTEGER,
+  gap_ts TEXT,
   PRIMARY KEY (session_id, key)
 );
 CREATE INDEX IF NOT EXISTS requests_ts ON requests(ts);
@@ -144,6 +151,17 @@ CREATE TABLE IF NOT EXISTS compactions (
   ts TEXT,
   PRIMARY KEY (session_id, agent, key)
 );
+
+-- 用户按中断的标记（type 为 user、内容为 [Request interrupted by user...] 的记录）。只记时间，不存内容。
+-- wait_ms 是中断前已经等了多久：中断标记的时间 - 它之前最近的一条用户记录或回复块的时间
+CREATE TABLE IF NOT EXISTS interrupts (
+  session_id TEXT NOT NULL,
+  agent TEXT NOT NULL,
+  key TEXT NOT NULL,
+  ts TEXT,
+  wait_ms INTEGER,
+  PRIMARY KEY (session_id, agent, key)
+);
 `;
 
 export interface FileRow {
@@ -191,6 +209,25 @@ export class Store {
     this.db = new DatabaseSync(dbPath);
     this.db.exec('PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA busy_timeout = 5000;');
     const ver = (this.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version;
+    if (ver >= 1 && ver <= 6) {
+      // v5 -> v6：requests 增加回复计时的四列（interrupts 表由下面的 SCHEMA 建）。v1 到 v5 的各分支都会重置读取进度，重读时补上。
+      // v6 在开发过程中改过（加了 max_gap_ms、gap_ts 和 interrupts.wait_ms）：缺列的开发版 v6 库补列后同样从头重读
+      const colsOf = (t: string) => (this.db.prepare(`PRAGMA table_info(${t})`).all() as Array<{ name: string }>).map((c) => c.name);
+      let added = false;
+      const cols = colsOf('requests');
+      for (const [c, type] of [['prompt_ts', 'TEXT'], ['end_ts', 'TEXT'], ['max_gap_ms', 'INTEGER'], ['gap_ts', 'TEXT']]) {
+        if (!cols.includes(c)) {
+          this.db.exec(`ALTER TABLE requests ADD COLUMN ${c} ${type};`);
+          added = true;
+        }
+      }
+      const icols = colsOf('interrupts');
+      if (icols.length > 0 && !icols.includes('wait_ms')) {
+        this.db.exec('ALTER TABLE interrupts ADD COLUMN wait_ms INTEGER;');
+        added = true;
+      }
+      if (ver === 6 && added) this.db.exec(`UPDATE files SET offset = 0, size = -1, mtime_ms = -1, fingerprint = '' WHERE present = 1;`);
+    }
     if (ver === 1 || ver === 2) {
       if (ver === 1) {
         // v1 -> v2：files 增加 pending_tools。已有文件需要从头重读一遍才能得到这个状态；
@@ -202,14 +239,14 @@ export class Store {
       this.db.exec(`UPDATE sessions SET cwd = NULL
           WHERE session_id IN (SELECT session_id FROM files WHERE present = 1 AND agent = 'main');
         UPDATE files SET offset = 0, size = -1, mtime_ms = -1, fingerprint = '' WHERE present = 1;`);
-      // （这里的重读同时补上 v4 的 agent_listings 和 v5 的 compactions）
-    } else if (ver === 3 || ver === 4) {
-      // v3 -> v4：新增 agent_listings；v4 -> v5：新增 compactions。日志还在的文件重置读取进度，从头重读一遍补上这些表；
+      // （这里的重读同时补上 v4 的 agent_listings、v5 的 compactions 和 v6 的回复计时、中断）
+    } else if (ver === 3 || ver === 4 || ver === 5) {
+      // v3 -> v4：新增 agent_listings；v4 -> v5：新增 compactions；v5 -> v6：回复计时和中断。日志还在的文件重置读取进度，从头重读一遍补上这些表；
       // 已入库的数据不删（去重键保证重读不会重复计数），日志已经被清理的文件（present = 0）不动，它们的统计原样保留
       this.db.exec(`UPDATE files SET offset = 0, size = -1, mtime_ms = -1, fingerprint = '' WHERE present = 1;`);
     } else if (ver !== 0 && ver !== SCHEMA_VERSION) {
       // 不认识的版本：重建
-      for (const t of ['files', 'sessions', 'requests', 'advisor_usage', 'tool_uses', 'agent_results', 'notifications', 'agent_meta', 'agent_listings', 'compactions']) {
+      for (const t of ['files', 'sessions', 'requests', 'advisor_usage', 'tool_uses', 'agent_results', 'notifications', 'agent_meta', 'agent_listings', 'compactions', 'interrupts']) {
         this.db.exec(`DROP TABLE IF EXISTS ${t}`);
       }
     }
@@ -249,8 +286,8 @@ export class Store {
     // 去重：同一会话同一去重键逐字段取最大值；主文件优先拥有该请求
     p(
       'upsertRequest',
-      `INSERT INTO requests (session_id, key, agent, model, ts, day, effort, advisor_model, input, output, cache_read, cache_create, cw5m, cw1h, advisor_calls)
-       VALUES (@session_id, @key, @agent, @model, @ts, @day, @effort, @advisor_model, @input, @output, @cache_read, @cache_create, @cw5m, @cw1h, @advisor_calls)
+      `INSERT INTO requests (session_id, key, agent, model, ts, day, effort, advisor_model, input, output, cache_read, cache_create, cw5m, cw1h, advisor_calls, prompt_ts, end_ts, max_gap_ms, gap_ts)
+       VALUES (@session_id, @key, @agent, @model, @ts, @day, @effort, @advisor_model, @input, @output, @cache_read, @cache_create, @cw5m, @cw1h, @advisor_calls, @prompt_ts, @end_ts, @max_gap_ms, @gap_ts)
        ON CONFLICT(session_id, key) DO UPDATE SET
          agent = CASE WHEN excluded.agent = 'main' THEN 'main' ELSE requests.agent END,
          model = CASE WHEN requests.model IS NULL OR (requests.model = '<synthetic>' AND excluded.model IS NOT NULL) THEN excluded.model ELSE requests.model END,
@@ -264,7 +301,11 @@ export class Store {
          cache_create = MAX(requests.cache_create, excluded.cache_create),
          cw5m = MAX(requests.cw5m, excluded.cw5m),
          cw1h = MAX(requests.cw1h, excluded.cw1h),
-         advisor_calls = MAX(requests.advisor_calls, excluded.advisor_calls)`,
+         advisor_calls = MAX(requests.advisor_calls, excluded.advisor_calls),
+         prompt_ts = CASE WHEN requests.prompt_ts IS NULL OR (excluded.prompt_ts IS NOT NULL AND excluded.prompt_ts < requests.prompt_ts) THEN excluded.prompt_ts ELSE requests.prompt_ts END,
+         end_ts = CASE WHEN requests.end_ts IS NULL OR (excluded.end_ts IS NOT NULL AND excluded.end_ts > requests.end_ts) THEN excluded.end_ts ELSE requests.end_ts END,
+         gap_ts = CASE WHEN excluded.max_gap_ms IS NOT NULL AND (requests.max_gap_ms IS NULL OR excluded.max_gap_ms > requests.max_gap_ms) THEN excluded.gap_ts ELSE requests.gap_ts END,
+         max_gap_ms = CASE WHEN excluded.max_gap_ms IS NOT NULL AND (requests.max_gap_ms IS NULL OR excluded.max_gap_ms > requests.max_gap_ms) THEN excluded.max_gap_ms ELSE requests.max_gap_ms END`,
     );
     p(
       'upsertAdvisor',
@@ -321,6 +362,12 @@ export class Store {
          trigger = CASE WHEN compactions.trigger = 'unknown' THEN excluded.trigger ELSE compactions.trigger END,
          pre_tokens = COALESCE(compactions.pre_tokens, excluded.pre_tokens),
          ts = COALESCE(compactions.ts, excluded.ts)`,
+    );
+    // 中断：同一条记录重读不重复计数
+    p(
+      'upsertInterrupt',
+      `INSERT INTO interrupts (session_id, agent, key, ts, wait_ms) VALUES (@session_id, @agent, @key, @ts, @wait_ms)
+       ON CONFLICT(session_id, agent, key) DO UPDATE SET ts = COALESCE(interrupts.ts, excluded.ts), wait_ms = COALESCE(interrupts.wait_ms, excluded.wait_ms)`,
     );
     // 移除：只记在加入之后的移除；没加入过的类型不记
     p(
@@ -413,6 +460,10 @@ export class Store {
           cw5m: r.usage.cw5m,
           cw1h: r.usage.cw1h,
           advisor_calls: r.advisor.length,
+          prompt_ts: r.promptTs,
+          end_ts: r.endTs,
+          max_gap_ms: r.maxGapMs,
+          gap_ts: r.gapTs,
         });
         for (const a of r.advisor) {
           this.st.upsertAdvisor.run({
@@ -466,6 +517,9 @@ export class Store {
       }
       for (const c of batch.compactions) {
         this.st.upsertCompaction.run({ session_id: sid, agent, key: c.key, trigger: c.trigger, pre_tokens: c.preTokens, ts: c.ts });
+      }
+      for (const x of batch.interrupts) {
+        this.st.upsertInterrupt.run({ session_id: sid, agent, key: x.key, ts: x.ts, wait_ms: x.waitMs });
       }
       this.st.upsertFile.run({ ...file });
       this.db.exec('COMMIT');

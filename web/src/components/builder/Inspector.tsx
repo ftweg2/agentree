@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import type { AgentTemplateInfo, ClaudeMdRuleState, EffectItem, EffectReport, PlanNote } from '../../types';
-import { relativeTime as formatRelative } from '../../lib/format';
+import { relativeTime as formatRelative, shortNumber } from '../../lib/format';
 import { CompactSelect, EffortSelect, ModelInput } from '../inputs';
 import Modal from '../Modal';
 import {
@@ -26,7 +26,7 @@ import {
   type NodeState,
 } from './model';
 
-export type Section = 'basic' | 'when' | 'tools' | 'prompt' | 'effect';
+export type Section = 'basic' | 'when' | 'tools' | 'dispatch' | 'prompt' | 'compact' | 'effect';
 
 interface Props {
   node: BNode;
@@ -39,9 +39,20 @@ interface Props {
   onDisk: boolean;
   templates: AgentTemplateInfo[];
   rule: ClaudeMdRuleState | null;
+  /** 用户自己改过的规则文字；null 表示用按画布自动生成的 autoRuleText */
   ruleText: string | null;
+  /** 按画布上的方案自动生成的规则文字（shared/rule.ts）；方案里既没有子 agent 也没有 advisor 时为空 */
+  autoRuleText: string;
+  /** 自动生成的规则包含什么，如"分工 3 个子 agent · advisor 3 条" */
+  autoRuleSummary: string;
   /** 打开时滚动到哪一节 */
   focus: Section | null;
+  /** 主会话节点上的自动压缩阈值：主会话和全部子 agent 共用这一个，子 agent 面板里只读地显示 */
+  mainCompact: number | null;
+  /** 主会话没设自动压缩阈值时，子 agent 面板里怎么说（项目方案是跟全局方案） */
+  compactUnsetText: string;
+  /** 选中主会话节点，滚到它的自动压缩那一节 */
+  onGoMainCompact: () => void;
   onPatch: (p: Partial<BNode>) => void;
   onRuleText: (t: string | null) => void;
   /** 用磁盘上的定义覆盖画布上的内容 */
@@ -160,9 +171,17 @@ export default function Inspector(p: Props) {
               <div className="field-hint" style={{ marginTop: 10 }}>
                 主会话派发时如果另外指定了模型，以派发时指定的为准。会话页能看到每次派发实际用的是哪个。
               </div>
+              <div className="insp-inherit">
+                <span className="k">自动压缩</span>
+                <span className="v">{p.mainCompact != null ? `跟主会话：${shortNumber(p.mainCompact)} token` : p.compactUnsetText}</span>
+                <button className="btn sm" onClick={p.onGoMainCompact} title="选中主会话节点，打开它的自动压缩阈值">
+                  去主会话改
+                </button>
+              </div>
+              <div className="field-hint">Claude Code 不支持给单个子 agent 单独设自动压缩阈值，主会话和全部子 agent 共用一个。</div>
             </div>
 
-            {!builtin && <ToolsSection node={n} onPatch={p.onPatch} />}
+            {!builtin && <ToolsSection node={n} onPatch={p.onPatch} dispatchIssue={issueOf('dispatch')} />}
 
             {!builtin && (
               <div className="insp-sec" data-sec="prompt">
@@ -246,6 +265,7 @@ export default function Inspector(p: Props) {
             <div className="field-hint" style={{ marginTop: 10 }}>
               上下文累积到这么多 token 时，Claude Code 会自动把之前的对话压缩成摘要（写到 settings 的 <span className="mono">autoCompactWindow</span>）。
               不指定时用 Claude Code 的默认：1M 上下文的模型约 967K，200K 的模型 200K。设得再高也不会超过模型自己的上下文上限；设低一些可以让长会话更早瘦身，但会更早丢掉细节。
+              主会话和全部子 agent 共用这一个阈值，Claude Code 不支持给单个子 agent 单独设。
               环境变量 <span className="mono">CLAUDE_CODE_AUTO_COMPACT_WINDOW</span> 和 <span className="mono">DISABLE_AUTO_COMPACT</span> 会让这个设置失效，配置页的环境变量检查会列出来。
             </div>
           </div>
@@ -262,7 +282,7 @@ export default function Inspector(p: Props) {
           </div>
         )}
 
-        {n.kind === 'rule' && <RuleSection rule={p.rule} text={p.ruleText} onText={p.onRuleText} />}
+        {n.kind === 'rule' && <RuleSection rule={p.rule} text={p.ruleText} autoText={p.autoRuleText} autoSummary={p.autoRuleSummary} onText={p.onRuleText} />}
 
         {p.isLinked && (
           <div className="insp-sec" data-sec="effect">
@@ -315,7 +335,7 @@ export default function Inspector(p: Props) {
   );
 }
 
-function ToolsSection({ node: n, onPatch }: { node: BNode; onPatch: (p: Partial<BNode>) => void }) {
+function ToolsSection({ node: n, onPatch, dispatchIssue }: { node: BNode; onPatch: (p: Partial<BNode>) => void; dispatchIssue: NodeIssue | null }) {
   const preset = toolPresetOf(n.tools);
   // 选了"自己选"之后，即使勾选结果恰好等于某个预置，也保持展开
   const [custom, setCustom] = useState(preset === 'custom');
@@ -404,30 +424,92 @@ function ToolsSection({ node: n, onPatch }: { node: BNode; onPatch: (p: Partial<
         允许它再派发子 agent
       </label>
       <div className="field-hint">{spawn ? '它可以把任务再分给别的子 agent（最多往下三层）。它能派发哪些类型无法单独限制。' : '它只能自己干活，不能再往下分派。这样用量更容易控制。'}</div>
+
+      {/* 关掉派发时会顺带清掉这一项；从模板或配置文件改回来时可能留下不一致的值，这时也显示出来让用户清掉 */}
+      {(spawn || n.dispatchModel !== null) && (
+        <div className="insp-sub" data-sec="dispatch">
+          <label className="insp-sub-label" htmlFor="bi-dispatch">
+            往下派发时指定的模型
+          </label>
+          <ModelInput
+            id="bi-dispatch"
+            value={n.dispatchModel}
+            onChange={(v) => onPatch({ dispatchModel: v })}
+            emptyLabel="不指定（按 Claude Code 的规则）"
+            placeholder="如 haiku 或 claude-haiku-4-5"
+          />
+          {dispatchIssue && <div className="field-err">{dispatchIssue.text}</div>}
+          <div className="field-hint" style={{ marginTop: 8 }}>
+            不指定时，下一层用什么模型按 Claude Code 的规则：有定义文件的 agent 用它自己定义里的模型；Explore、general-purpose 这类内置类型在它下面跑时用的是主会话的模型（Explore 最高到
+            Opus），不是它的。这里选了模型，会写进它的提示词，要它每次派发都传这个 model 参数。这是提示不是硬性限制，会话页能看到每次派发实际传的是哪个。
+          </div>
+        </div>
+      )}
     </div>
   );
 }
 
-function RuleSection({ rule, text, onText }: { rule: ClaudeMdRuleState | null; text: string | null; onText: (t: string | null) => void }) {
-  const current = text ?? rule?.text ?? rule?.defaultText ?? '';
+/**
+ * 规则内容。text 为 null 时显示按画布自动生成的文字，画布上增删子 agent、改描述后跟着变；
+ * 用户一改文字就变成自定义（text 非 null），之后不再跟着画布变，可以一键恢复成自动生成的
+ */
+function RuleSection({
+  rule,
+  text,
+  autoText,
+  autoSummary,
+  onText,
+}: {
+  rule: ClaudeMdRuleState | null;
+  text: string | null;
+  autoText: string;
+  autoSummary: string;
+  onText: (t: string | null) => void;
+}) {
+  const custom = text !== null;
+  const current = text ?? autoText;
   return (
     <div className="insp-sec" data-sec="prompt">
-      <h3>规则内容</h3>
+      <div className="row" style={{ marginBottom: 12 }}>
+        <h3 style={{ margin: 0 }}>规则内容</h3>
+        <span className="spacer" />
+        <span className="small dim">{custom ? '自定义文字' : autoSummary ? `自动生成 · ${autoSummary}` : '自动生成'}</span>
+      </div>
       {rule?.error && (
         <div className="alert error" style={{ animation: 'none', marginBottom: 10 }}>
           <div className="alert-body small">CLAUDE.md 里的规则标记有问题，agentree 不会修改它：{rule.error}</div>
         </div>
       )}
-      <textarea className="textarea prompt-area" rows={9} value={current} onChange={(e) => onText(e.target.value)} disabled={!rule} />
-      <div className="row wrap" style={{ gap: 6, marginTop: 8 }}>
-        {rule && current !== rule.defaultText && (
-          <button className="btn sm" onClick={() => onText(rule.defaultText)}>
-            恢复默认文案
+      {custom && (
+        <div className="alert warn" style={{ animation: 'none', marginBottom: 10 }}>
+          <div className="alert-body small">你改过规则文字，之后画布上增删子 agent 不会自动更新这段。</div>
+        </div>
+      )}
+      {!custom && !autoText && (
+        <div className="field-hint" style={{ marginBottom: 8 }}>
+          方案里还没有子 agent，也没有 advisor，暂时没有要写的规则。加上子 agent 或 advisor 后，这里会自动生成。
+        </div>
+      )}
+      <textarea
+        className="textarea prompt-area"
+        rows={14}
+        value={current}
+        onChange={(e) => onText(e.target.value)}
+        disabled={!rule}
+        placeholder="也可以自己写一段规则"
+        spellCheck={false}
+      />
+      {custom && (
+        <div className="row wrap" style={{ gap: 6, marginTop: 8 }}>
+          <button className="btn sm" onClick={() => onText(null)}>
+            恢复成自动生成的
           </button>
-        )}
-      </div>
+        </div>
+      )}
       <div className="field-hint" style={{ marginTop: 10 }}>
-        这段话会写进 CLAUDE.md。Claude Code 每次开始会话都会读 CLAUDE.md，所以主会话会照着它做。agentree 只管理自己加的这一段，文件里的其他内容不动。
+        这段话会写进 CLAUDE.md。Claude Code 每次开始会话都会读 CLAUDE.md，所以主会话会照着它做。
+        Claude Code 默认由主会话自己决定要不要派发，不写分工的话它常常从头到尾自己干；自动生成的文字会列出画布上的子 agent，告诉主会话把活分给它们。
+        agentree 只管理自己加的这一段，文件里的其他内容不动。
       </div>
     </div>
   );
@@ -485,6 +567,8 @@ const FIELD_LABEL: Record<string, string> = {
   prompt: '系统提示词',
   name: '名字',
   text: '规则内容',
+  dispatch: '往下派发的模型',
+  dispatchModel: '往下派发的模型',
 };
 const ITEM_LABEL: Record<EffectItem['kind'], string> = {
   'main-model': '主模型',
@@ -493,7 +577,32 @@ const ITEM_LABEL: Record<EffectItem['kind'], string> = {
   advisor: 'advisor',
   rule: 'CLAUDE.md 规则',
   agent: '定义文件',
+  'agent-dispatch': '往下派发的模型',
 };
+/** 往下派发的模型看的是它派发出去的子节点，派发时传的 model 参数对不对 */
+const O_DISPATCH_LABEL: Record<EffectItem['observed']['state'], string> = { match: '派发时都传了这个模型', mismatch: '有派发没传这个模型', 'not-seen': '它还没派发过子 agent', 'n/a': '无法判断' };
+
+function observedLabel(it: EffectItem): string {
+  if (it.kind === 'main-model' || it.kind === 'main-effort') return O_MAIN_LABEL[it.observed.state];
+  if (it.kind === 'main-compact') return O_COMPACT_LABEL[it.observed.state];
+  if (it.kind === 'agent-dispatch') return O_DISPATCH_LABEL[it.observed.state];
+  return O_LABEL[it.observed.state];
+}
+
+function observedCount(it: EffectItem): string {
+  const { count, matched } = it.observed;
+  if (it.kind === 'advisor') return `被调用 ${count} 次`;
+  if (it.kind === 'agent') return `${count} 次里 ${matched} 次符合`;
+  if (it.kind === 'agent-dispatch') return `派发了 ${count} 个，${matched} 个传了这个模型`;
+  if (it.kind === 'main-compact') return `${count} 个会话自动压缩过，${matched} 个在阈值附近`;
+  return `${count} 个会话里 ${matched} 个符合`;
+}
+
+function itemTitle(it: EffectItem): string {
+  if (it.kind === 'agent') return it.name ?? ITEM_LABEL.agent;
+  if (it.kind === 'agent-dispatch') return it.name ? `${it.name} · ${ITEM_LABEL['agent-dispatch']}` : ITEM_LABEL['agent-dispatch'];
+  return ITEM_LABEL[it.kind];
+}
 
 const L_LABEL: Record<EffectItem['loaded']['state'], string> = {
   yes: '已加载',
@@ -526,7 +635,7 @@ export function EffectList({ items, loading, invalid, onPull, showTitle = true }
         <div key={it.key} className={`effect-item ${itemState(it)}`}>
           {showTitle && (
             <div className="effect-title">
-              <b>{it.kind === 'agent' ? it.name : ITEM_LABEL[it.kind]}</b>
+              <b>{itemTitle(it)}</b>
               {it.expected && <span className="mono dim">{it.expected}</span>}
             </div>
           )}
@@ -548,7 +657,8 @@ export function EffectList({ items, loading, invalid, onPull, showTitle = true }
                 )}
               </div>
             </div>
-            {it.loaded && it.loaded.state !== 'n/a' && (
+            {/* 往下派发的模型没有"加载"这一步（契约里恒为 n/a） */}
+            {it.loaded && it.loaded.state !== 'n/a' && it.kind !== 'agent-dispatch' && (
               <div className={`effect-step ${stepClass('l', it)}`}>
                 <i />
                 <div>
@@ -563,26 +673,14 @@ export function EffectList({ items, loading, invalid, onPull, showTitle = true }
             <div className={`effect-step ${stepClass('o', it)}`}>
               <i />
               <div>
-                <div className="k">实际运行</div>
+                <div className="k">{it.kind === 'agent-dispatch' ? '它派发时传的模型' : '实际运行'}</div>
                 <div className="v">
-                  {(it.kind === 'main-model' || it.kind === 'main-effort' ? O_MAIN_LABEL : it.kind === 'main-compact' ? O_COMPACT_LABEL : O_LABEL)[it.observed.state]}
-                  {it.observed.count > 0 && (
-                    <span className="dim">
-                      （
-                      {it.kind === 'advisor'
-                        ? `被调用 ${it.observed.count} 次`
-                        : it.kind === 'agent'
-                          ? `${it.observed.count} 次里 ${it.observed.matched} 次符合`
-                          : it.kind === 'main-compact'
-                            ? `${it.observed.count} 个会话自动压缩过，${it.observed.matched} 个在阈值附近`
-                            : `${it.observed.count} 个会话里 ${it.observed.matched} 个符合`}
-                      ）
-                    </span>
-                  )}
+                  {observedLabel(it)}
+                  {it.observed.count > 0 && <span className="dim">（{observedCount(it)}）</span>}
                 </div>
                 {it.observed.actual.length > 0 && it.observed.state !== 'match' && (
                   <div className="d">
-                    {it.kind === 'main-compact' ? '压缩前的上下文：' : '实际用的是：'}
+                    {it.kind === 'main-compact' ? '压缩前的上下文：' : it.kind === 'agent-dispatch' ? '实际传的是：' : '实际用的是：'}
                     {it.observed.actual.join('、')}
                     {it.kind === 'main-compact' ? ' token' : ''}
                   </div>
@@ -597,7 +695,7 @@ export function EffectList({ items, loading, invalid, onPull, showTitle = true }
           </div>
           <div className="effect-summary">{it.summary}</div>
           {it.nextStep && <div className="effect-next">下一步：{it.nextStep}</div>}
-          {it.kind === 'agent' && it.written.state === 'differs' && onPull && (
+          {(it.kind === 'agent' || it.kind === 'agent-dispatch') && it.written.state === 'differs' && onPull && (
             <button className="btn sm" style={{ marginTop: 8 }} onClick={onPull} title="放弃画布上对这个 agent 的修改，改用配置文件里现在的内容">
               改用配置文件里的内容
             </button>

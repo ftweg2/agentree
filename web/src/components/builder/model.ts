@@ -1,5 +1,7 @@
 import type { EffectItem, EffectReport, Preset, PresetAgent } from '../../types';
 import type { Pt } from '../canvas/useCanvasView';
+import { DISPATCH_MODEL_RE } from '../../../../shared/dispatch';
+import { ADVISOR_RULE_TEXT } from '../../../../shared/rule';
 
 /**
  * 搭建页的数据模型。
@@ -30,6 +32,8 @@ export interface BNode {
   prompt: string;
   /** 自动压缩阈值（token 数）；只有主会话用。null 表示不指定，跟 Claude Code 默认 */
   autoCompactWindow: number | null;
+  /** 子 agent 往下派发时要传给 Agent 工具的 model 参数；null 表示不指定。只有子 agent 用 */
+  dispatchModel: string | null;
 }
 
 export interface Graph {
@@ -37,7 +41,7 @@ export interface Graph {
   /** 连到主会话的节点 id */
   linked: string[];
   allowBuiltins: boolean;
-  /** CLAUDE.md 规则的文案；null 表示用默认文案（已有规则块时保持原样） */
+  /** CLAUDE.md 规则的文字；null 表示用按画布上的方案自动生成的文字（shared/rule.ts），画布变了跟着变 */
   ruleText: string | null;
   /** 项目方案的画布上有一个"全局方案"节点，这是它的位置 */
   globalPos?: Pt;
@@ -57,6 +61,14 @@ export const NODE_H: Record<Kind, number> = {
   rule: 134,
   agent: 310,
 };
+/** 节点卡片上可点的一行（如"往下派发"）的高度 */
+export const ROW_H = 31;
+
+/** 子 agent 节点卡片上有没有"往下派发"这一行 */
+export const showsDispatch = (n: BNode) => n.kind === 'agent' && !!clean(n.dispatchModel) && !isBuiltin(n.name);
+
+/** 某个节点的大致高度：子 agent 设了往下派发的模型时多一行 */
+export const nodeHeight = (n: BNode) => NODE_H[n.kind] + (showsDispatch(n) ? ROW_H : 0);
 
 export const KIND_LABEL: Record<Kind, string> = {
   main: '主会话',
@@ -97,6 +109,7 @@ export function blankNode(kind: Kind, init?: Partial<BNode>): BNode {
     disallowedTools: null,
     prompt: '',
     autoCompactWindow: null,
+    dispatchModel: null,
     ...init,
   };
 }
@@ -139,6 +152,7 @@ function readNode(raw: unknown): BNode | null {
     disallowedTools: opt(n.disallowedTools),
     prompt: str(n.prompt),
     autoCompactWindow: n.kind === 'main' && isValidWindow(n.autoCompactWindow) ? n.autoCompactWindow : null,
+    dispatchModel: n.kind === 'agent' ? opt(n.dispatchModel) : null,
   });
 }
 
@@ -162,9 +176,18 @@ function readDraft(raw: unknown): Graph | null {
     nodes,
     linked: Array.isArray(g.linked) ? [...new Set(g.linked.filter((id): id is string => typeof id === 'string' && ids.has(id) && id !== 'main'))] : [],
     allowBuiltins: g.allowBuiltins !== false,
-    ruleText: typeof g.ruleText === 'string' ? g.ruleText : null,
+    ruleText: storedRuleText(g.ruleText),
     ...(g.globalPos && Number.isFinite(g.globalPos.x) && Number.isFinite(g.globalPos.y) ? { globalPos: { x: Math.round(g.globalPos.x), y: Math.round(g.globalPos.y) } } : {}),
   };
+}
+
+/**
+ * 存下来的规则文字。早先版本点"恢复默认文案"会把那时的默认文字（只有 advisor 三条）存成自定义文字，
+ * 这种当作没改过（null），改用自动生成的
+ */
+function storedRuleText(v: unknown): string | null {
+  if (typeof v !== 'string') return null;
+  return v.replace(/\r\n/g, '\n').trim() === ADVISOR_RULE_TEXT ? null : v;
 }
 
 export function loadStored(cwd: string | null = null): Stored {
@@ -183,7 +206,7 @@ export function loadStored(cwd: string | null = null): Stored {
       pos: s.pos ?? {},
       loose: Array.isArray(s.loose) ? s.loose.map(readNode).filter((n): n is BNode => !!n && n.kind !== 'main') : [],
       rule: !!s.rule,
-      ruleText: typeof s.ruleText === 'string' ? s.ruleText : null,
+      ruleText: storedRuleText(s.ruleText),
       draft: readDraft(s.draft),
     };
   } catch {
@@ -234,19 +257,25 @@ export const globalHeight = (agents: number) => 150 + (Math.max(1, agents) + 1) 
 
 /** "全局方案"节点自动排列时的位置：左边一列，排在 advisor 和规则下面 */
 export function globalHome(nodes: BNode[], linked: Set<string>): Pt {
-  const agents = nodes.filter((n) => n.kind === 'agent' && linked.has(n.id)).length;
-  const colH = Math.max(1, agents) * (NODE_H.agent + 26) - 26;
+  const colH = agentColumnHeight(nodes.filter((n) => n.kind === 'agent' && linked.has(n.id)));
   const mainY = Math.round(Math.max(0, colH / 2 - NODE_H.main / 2));
   return { x: 0, y: mainY - 70 + NODE_H.advisor + 26 + NODE_H.rule + 26 };
+}
+
+const COL_GAP = 26;
+
+/** 右边一列子 agent 的总高度；各节点高度不一样（有的多一行"往下派发"） */
+function agentColumnHeight(agents: BNode[]): number {
+  if (!agents.length) return NODE_H.agent;
+  return agents.reduce((h, n) => h + nodeHeight(n) + COL_GAP, 0) - COL_GAP;
 }
 
 /** 自动排列：输入在左，主会话居中，子 agent 在右边排成一列，草稿放在最下面 */
 export function arrange(nodes: BNode[], linked: Set<string>): BNode[] {
   const agents = nodes.filter((n) => n.kind === 'agent' && linked.has(n.id));
   const loose = nodes.filter((n) => n.kind !== 'main' && !linked.has(n.id));
-  const GAP = 26;
-  const step = NODE_H.agent + GAP;
-  const colH = Math.max(1, agents.length) * step - GAP;
+  const GAP = COL_GAP;
+  const colH = agentColumnHeight(agents);
   const mainY = Math.round(Math.max(0, colH / 2 - NODE_H.main / 2));
   const out = new Map<string, Pt>();
   for (const n of nodes) {
@@ -254,7 +283,11 @@ export function arrange(nodes: BNode[], linked: Set<string>): BNode[] {
     else if (n.kind === 'advisor' && linked.has(n.id)) out.set(n.id, { x: 0, y: mainY - 70 });
     else if (n.kind === 'rule' && linked.has(n.id)) out.set(n.id, { x: 0, y: mainY + NODE_H.advisor - 70 + GAP });
   }
-  agents.forEach((n, i) => out.set(n.id, { x: 820, y: i * step }));
+  let y = 0;
+  for (const n of agents) {
+    out.set(n.id, { x: 820, y });
+    y += nodeHeight(n) + GAP;
+  }
   const looseY = Math.max(colH, mainY + NODE_H.main, mainY + NODE_H.advisor + NODE_H.rule) + 70;
   loose.forEach((n, i) => out.set(n.id, { x: i * (BW + 28), y: looseY }));
   return nodes.map((n) => ({ ...n, ...(out.get(n.id) ?? { x: n.x, y: n.y }) }));
@@ -296,6 +329,8 @@ export function graphFromPreset(p: Preset, stored: Omit<Stored, 'draft'>, disk: 
       tools: a.tools !== undefined ? a.tools : (d?.tools ?? null),
       disallowedTools: a.disallowedTools !== undefined ? a.disallowedTools : (d?.disallowedTools ?? null),
       prompt: a.prompt ?? d?.prompt ?? '',
+      // 方案里没有这一项（旧方案）时，和其他字段一样看磁盘上的定义文件里有没有 agentree 写的派发块，都没有就是 null
+      dispatchModel: a.dispatchModel !== undefined ? clean(a.dispatchModel) : clean(d?.dispatchModel),
     });
     nodes.push(n);
     linked.push(n.id);
@@ -322,6 +357,8 @@ function agentFromNode(n: BNode): PresetAgent {
     name,
     model: clean(n.model),
     effort: clean(n.effort),
+    // 始终显式给出：null 表示应用时删掉定义文件正文里 agentree 写的派发块
+    dispatchModel: clean(n.dispatchModel),
   };
   // 内置类型没有定义文件，只用来检查
   if (isBuiltin(name)) return a;
@@ -370,6 +407,8 @@ export function comparable(p: Preset) {
         tools: a.tools === undefined ? undefined : normalizeTools(a.tools),
         disallowedTools: a.disallowedTools === undefined ? undefined : normalizeTools(a.disallowedTools),
         prompt: a.prompt === undefined ? undefined : normalizePrompt(a.prompt),
+        // 旧方案没有这一项，当作 null：画布上没设时不算修改
+        dispatchModel: clean(a.dispatchModel),
       }))
       .sort((a, b) => a.name.localeCompare(b.name)),
     allowBuiltins: p.allowBuiltins,
@@ -386,7 +425,7 @@ export function nameError(name: string): string | null {
 export interface NodeIssue {
   /** error 会阻止保存和应用；warn 只是提醒 */
   level: 'error' | 'warn';
-  field: 'name' | 'description' | 'prompt' | 'model' | 'compact';
+  field: 'name' | 'description' | 'prompt' | 'model' | 'compact' | 'dispatch';
   text: string;
 }
 
@@ -420,6 +459,19 @@ export function validate(g: Graph): Map<string, NodeIssue[]> {
             text: '还没写系统提示词，它不知道该怎么干活',
           });
       }
+      const dm = clean(n.dispatchModel);
+      if (dm && !canSpawn(n))
+        issues.push({
+          level: 'error',
+          field: 'dispatch',
+          text: '它不能再派发子 agent，先打开允许再派发，或者清掉往下派发的模型',
+        });
+      else if (dm && !DISPATCH_MODEL_RE.test(dm))
+        issues.push({
+          level: 'error',
+          field: 'dispatch',
+          text: '往下派发的模型只能是别名（如 haiku）或完整的模型 ID，不能有空格',
+        });
     }
     if (n.kind === 'advisor' && !clean(n.model))
       issues.push({
@@ -577,12 +629,16 @@ export function canSpawn(n: Pick<BNode, 'tools' | 'disallowedTools'>): boolean {
   return splitTools(n.tools).some(isAgentTool);
 }
 
-export function setSpawn(n: Pick<BNode, 'tools' | 'disallowedTools'>, allow: boolean): Pick<BNode, 'tools' | 'disallowedTools'> {
+/** 改派发能力时要改的字段；关掉派发能力时顺带清掉"往下派发时指定的模型" */
+export type SpawnPatch = Pick<BNode, 'tools' | 'disallowedTools'> & { dispatchModel?: null };
+
+export function setSpawn(n: Pick<BNode, 'tools' | 'disallowedTools'>, allow: boolean): SpawnPatch {
   const dis = splitTools(n.disallowedTools).filter((t) => !isAgentTool(t));
+  const clear = allow ? {} : { dispatchModel: null };
   if (n.tools === null) {
     // 继承全部工具时，靠黑名单去掉派发能力
     if (!allow) dis.push('Agent');
-    return { tools: null, disallowedTools: dis.length ? dis.join(', ') : null };
+    return { tools: null, disallowedTools: dis.length ? dis.join(', ') : null, ...clear };
   }
   const list = splitTools(n.tools).filter((t) => !isAgentTool(t));
   if (allow) list.push('Agent');
@@ -590,17 +646,19 @@ export function setSpawn(n: Pick<BNode, 'tools' | 'disallowedTools'>, allow: boo
   return {
     tools: (list.length ? list : ['Read']).join(', '),
     disallowedTools: dis.length ? dis.join(', ') : null,
+    ...clear,
   };
 }
 
-/** 换一组工具，保持"能不能再派发"不变 */
+/** 换一组工具，保持"能不能再派发"不变，所以也不动往下派发的模型 */
 export function withTools(n: Pick<BNode, 'tools' | 'disallowedTools'>, tools: string[] | null): Pick<BNode, 'tools' | 'disallowedTools'> {
   const spawn = canSpawn(n);
   const base = {
     tools: tools === null ? null : tools.join(', ') || 'Read',
     disallowedTools: n.disallowedTools,
   };
-  return setSpawn(base, spawn);
+  const r = setSpawn(base, spawn);
+  return { tools: r.tools, disallowedTools: r.disallowedTools };
 }
 
 /** 节点上显示的一句话 */
@@ -680,7 +738,9 @@ export function itemsOf(n: BNode, report: EffectReport | null): EffectItem[] {
   if (n.kind === 'main') return report.items.filter((i) => i.kind === 'main-model' || i.kind === 'main-effort' || i.kind === 'main-compact');
   if (n.kind === 'advisor') return report.items.filter((i) => i.kind === 'advisor');
   if (n.kind === 'rule') return report.items.filter((i) => i.kind === 'rule');
-  return report.items.filter((i) => i.kind === 'agent' && i.name === n.name.trim());
+  // 子 agent 有两项：定义文件本身，和它往下派发时指定的模型（key 为 agent:<name>:dispatch）
+  const name = n.name.trim();
+  return report.items.filter((i) => (i.kind === 'agent' || i.kind === 'agent-dispatch') && i.name === name);
 }
 
 export function nodeState(n: BNode, isLinked: boolean, issues: NodeIssue[] | undefined, report: EffectReport | null): NodeState {

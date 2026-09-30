@@ -457,7 +457,7 @@ function RuleSection({
       </div>
       <div className="card-b stack" style={{ gap: 10 }}>
         <div className="small muted">
-          告诉主会话什么时候该咨询 advisor。规则写在两个标记之间，agentree 只改标记之间的内容，文件里的其他内容一个字节都不动。
+          告诉主会话怎么把活分给子 agent、什么时候该咨询 advisor。默认文字按搭建页保存的全局方案生成。规则写在两个标记之间，agentree 只改标记之间的内容，文件里的其他内容一个字节都不动。
         </div>
         {broken && (
           <div className="alert error" role="alert">
@@ -486,7 +486,7 @@ function RuleSection({
             <textarea className="textarea mono" rows={7} value={text} onChange={(e) => setText(e.target.value)} aria-label="规则文案" spellCheck={false} />
             <div className="row wrap">
               <button className="btn sm" onClick={() => setText(r.defaultText)} disabled={text === r.defaultText}>
-                恢复默认文案
+                恢复默认文字
               </button>
             </div>
           </>

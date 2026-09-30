@@ -2,6 +2,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { DISPATCH_MODEL_RE } from '../../shared/dispatch.ts';
 import type { Preset, PresetAgent, SchemeInfo, SchemeRef } from '../../shared/types.ts';
 import { agentreeHome, AUTO_COMPACT_MAX, AUTO_COMPACT_MIN, EFFORT_ORDER, isValidAutoCompactWindow } from './config.ts';
 import { PathError, validateAgentName } from './config/paths.ts';
@@ -57,7 +58,19 @@ export function normalizeTools(v: string): string | null {
 
 /** 两个工具列表是否相同（忽略空白和顺序） */
 export function sameTools(a: string | null, b: string | null): boolean {
-  const set = (v: string | null) => (v === null ? null : [...new Set(v.split(',').map((x) => x.trim()).filter(Boolean))].sort().join(','));
+  const set = (v: string | null) =>
+    v === null
+      ? null
+      : [
+          ...new Set(
+            v
+              .split(',')
+              .map((x) => x.trim())
+              .filter(Boolean),
+          ),
+        ]
+          .sort()
+          .join(',');
   return set(a) === set(b);
 }
 
@@ -78,6 +91,20 @@ function optTools(v: unknown, field: string): string | null | undefined {
   if (typeof v !== 'string') throw new Error(`${field} 必须是逗号分隔的字符串或 null`);
   const s = normalizeTools(v);
   if (s !== null && s.length > TOOLS_MAX) throw new Error(`${field} 太长：最多 ${TOOLS_MAX} 个字符，现在是 ${s.length} 个`);
+  return s;
+}
+
+/**
+ * dispatchModel：缺失返回 undefined（应用时不动已有的块），null 表示明确不要，字符串必须是别名或完整模型 ID。
+ * 去掉首尾空白后为空的字符串当作 null，和 model 等字段的空值处理一致
+ */
+function optDispatchModel(v: unknown, field: string): string | null | undefined {
+  if (v === undefined) return undefined;
+  if (v === null) return null;
+  if (typeof v !== 'string') throw new Error(`${field} 必须是字符串或 null`);
+  const s = v.trim();
+  if (!s) return null;
+  if (!DISPATCH_MODEL_RE.test(s)) throw new Error(`${field} 不合法：只能是模型别名（如 haiku）或完整模型 ID，不能有空格和特殊符号`);
   return s;
 }
 
@@ -124,6 +151,9 @@ export function validatePreset(input: unknown): Preset {
     if (disallowedTools !== undefined) pa.disallowedTools = disallowedTools;
     const prompt = optText(a.prompt, `agents[${i}].prompt`, PROMPT_MAX, false);
     if (prompt !== undefined) pa.prompt = prompt;
+    // 往下派发的模型：缺失、null、字符串三种含义不同（见 PresetAgent.dispatchModel），缺失时不放进对象
+    const dispatchModel = optDispatchModel(a.dispatchModel, `agents[${i}].dispatchModel`);
+    if (dispatchModel !== undefined) pa.dispatchModel = dispatchModel;
     return pa;
   });
   if (o.allowBuiltins !== undefined && typeof o.allowBuiltins !== 'boolean') throw new Error('allowBuiltins 必须是布尔值');
@@ -309,7 +339,7 @@ export class PresetStore {
 
   /** 应用记录：全局在 applied.json，项目在项目方案文件里 */
   getApplied(projectCwd: string | null = null): AppliedRecord | null {
-    return projectCwd === null ? readApplied() : this.project(projectCwd)?.applied ?? null;
+    return projectCwd === null ? readApplied() : (this.project(projectCwd)?.applied ?? null);
   }
 
   setApplied(rec: AppliedRecord, projectCwd: string | null = null): void {

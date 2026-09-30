@@ -3,7 +3,7 @@ import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import type { SessionSummary } from '../types';
 import { api } from '../api/client';
 import { useApi, useNow } from '../lib/useApi';
-import { formatDateTime, fullNumber, projectLabel, relativeTime } from '../lib/format';
+import { awaitingMinutes, formatDateTime, fullNumber, projectLabel, relativeTime } from '../lib/format';
 import { Cost, EffortTag, Empty, ErrorBox, ModelTag, SkeletonRows, Tok, VerdictBadge } from '../components/ui';
 
 type SortKey = 'recent' | 'started' | 'tokens' | 'requests' | 'agents';
@@ -198,62 +198,74 @@ export default function SessionsPage() {
                   </tr>
                 </thead>
                 <tbody>
-                  {rows.map((s, i) => (
-                    <tr
-                      key={s.id}
-                      className="clickable"
-                      style={{ ['--i' as string]: i }}
-                      onClick={() => navigate(`/sessions/${encodeURIComponent(s.id)}`)}
-                    >
-                      <td className="verdict-cell" style={{ maxWidth: 0, width: '42%', ['--vc' as string]: VERDICT_ROW_COLOR[s.conformance.verdict] }}>
-                        <div className="row" style={{ gap: 8, minWidth: 0 }}>
-                          {s.isActive && <span className="dot running" title="进行中" />}
-                          <Link
-                            to={`/sessions/${encodeURIComponent(s.id)}`}
-                            className="ellipsis"
-                            style={{ color: 'var(--text)', minWidth: 0, fontWeight: 550 }}
-                            title={s.title ?? s.id}
-                            onClick={(e) => e.stopPropagation()}
-                          >
-                            {s.title ?? <span className="dim">（无标题）{s.id.slice(0, 8)}</span>}
-                          </Link>
-                        </div>
-                        <div className="small dim ellipsis" style={{ marginTop: 2 }} title={s.cwd ?? s.projectDir}>
-                          <span className="mono">{projectLabel(s.projectDir, s.cwd)}</span> · {formatDateTime(s.startedAt)} 开始
-                        </div>
-                      </td>
-                      <td className="nowrap small" title={formatDateTime(s.lastActivityAt)}>
-                        {s.isActive ? <span style={{ color: 'var(--running)' }}>进行中</span> : relativeTime(s.lastActivityAt, now)}
-                      </td>
-                      <td className="nowrap">
-                        <span className="row" style={{ gap: 6 }}>
-                          <ModelTag model={s.mainModel} />
-                          {s.mainEffort && <EffortTag efforts={s.mainEffort} />}
-                        </span>
-                      </td>
-                      <td className="num">
-                        {s.agentCount}
-                        {s.maxDepth > 1 && <span className="dim small" title="最大嵌套深度"> ·{s.maxDepth}层</span>}
-                      </td>
-                      <td className="num" title={s.compactions.total ? `自动 ${s.compactions.auto} 次，手动 ${s.compactions.manual} 次` : '没有被压缩过'}>
-                        {s.compactions.total ? s.compactions.total : <span className="dim">—</span>}
-                      </td>
-                      <td className="num">{fullNumber(s.requests)}</td>
-                      <td className="num">
-                        <Tok n={s.tokens.total} />
-                      </td>
-                      <td className="num">
-                        <Cost usd={s.costUsd} />
-                      </td>
-                      <td className="nowrap">
-                        {s.conformance.verdict === 'not-checked' ? (
-                          <span className="dim small">—</span>
-                        ) : (
-                          <VerdictBadge verdict={s.conformance.verdict} fail={s.conformance.fail} warn={s.conformance.warn} />
-                        )}
-                      </td>
-                    </tr>
-                  ))}
+                  {rows.map((s, i) => {
+                    // 在等模型回复超过 1 分钟：告诉用户它在思考，不是死了
+                    const awaitMin = awaitingMinutes(s.awaitingReply?.since, now);
+                    return (
+                      <tr
+                        key={s.id}
+                        className="clickable"
+                        style={{ ['--i' as string]: i }}
+                        onClick={() => navigate(`/sessions/${encodeURIComponent(s.id)}`)}
+                      >
+                        <td className="verdict-cell" style={{ maxWidth: 0, width: '42%', ['--vc' as string]: VERDICT_ROW_COLOR[s.conformance.verdict] }}>
+                          <div className="row" style={{ gap: 8, minWidth: 0 }}>
+                            {(s.isActive || awaitMin !== null) && <span className="dot running" title={awaitMin !== null ? '在等模型回复' : '进行中'} />}
+                            <Link
+                              to={`/sessions/${encodeURIComponent(s.id)}`}
+                              className="ellipsis"
+                              style={{ color: 'var(--text)', minWidth: 0, fontWeight: 550 }}
+                              title={s.title ?? s.id}
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              {s.title ?? <span className="dim">（无标题）{s.id.slice(0, 8)}</span>}
+                            </Link>
+                          </div>
+                          <div className="small dim ellipsis" style={{ marginTop: 2 }} title={s.cwd ?? s.projectDir}>
+                            <span className="mono">{projectLabel(s.projectDir, s.cwd)}</span> · {formatDateTime(s.startedAt)} 开始
+                          </div>
+                        </td>
+                        <td className="nowrap small" title={formatDateTime(s.lastActivityAt)}>
+                          {awaitMin !== null ? (
+                            <span style={{ color: 'var(--running)' }} title="最后一条是用户消息或工具结果，模型还没有回复。高强度下模型会先思考很久，思考完成之前日志里没有任何输出">
+                              已等待回复 {awaitMin} 分钟
+                            </span>
+                          ) : s.isActive ? (
+                            <span style={{ color: 'var(--running)' }}>进行中</span>
+                          ) : (
+                            relativeTime(s.lastActivityAt, now)
+                          )}
+                        </td>
+                        <td className="nowrap">
+                          <span className="row" style={{ gap: 6 }}>
+                            <ModelTag model={s.mainModel} />
+                            {s.mainEffort && <EffortTag efforts={s.mainEffort} />}
+                          </span>
+                        </td>
+                        <td className="num">
+                          {s.agentCount}
+                          {s.maxDepth > 1 && <span className="dim small" title="最大嵌套深度"> ·{s.maxDepth}层</span>}
+                        </td>
+                        <td className="num" title={s.compactions.total ? `自动 ${s.compactions.auto} 次，手动 ${s.compactions.manual} 次` : '没有被压缩过'}>
+                          {s.compactions.total ? s.compactions.total : <span className="dim">—</span>}
+                        </td>
+                        <td className="num">{fullNumber(s.requests)}</td>
+                        <td className="num">
+                          <Tok n={s.tokens.total} />
+                        </td>
+                        <td className="num">
+                          <Cost usd={s.costUsd} />
+                        </td>
+                        <td className="nowrap">
+                          {s.conformance.verdict === 'not-checked' ? (
+                            <span className="dim small">—</span>
+                          ) : (
+                            <VerdictBadge verdict={s.conformance.verdict} fail={s.conformance.fail} warn={s.conformance.warn} />
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

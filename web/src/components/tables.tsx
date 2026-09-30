@@ -7,6 +7,7 @@ const FIELD_LABEL: Record<ConformanceCheck['field'], string> = {
   model: '模型',
   effort: 'effort',
   advisor: 'advisor',
+  dispatch: '派发时传的模型',
 };
 
 export function ChecksList({ checks, empty }: { checks: ConformanceCheck[]; empty?: string }) {

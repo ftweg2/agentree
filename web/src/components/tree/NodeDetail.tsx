@@ -184,6 +184,30 @@ export default function NodeDetail({ node, index, sessionChecks, onSelect, onClo
           </div>
         )}
 
+        {node.replyWait?.longest && (
+          <div className="insp-sec">
+            <h3>回复等待</h3>
+            <div className="stack" style={{ gap: 6 }}>
+              <div className="row wrap">
+                <span
+                  className="badge muted"
+                  title="一次回复里最长的一段没有输出的时间：之前的用户消息或工具结果到第一块，或者同一次回复里相邻两块之间。高强度下模型会先思考很久，思考完成之前没有任何输出"
+                >
+                  最长一段没有输出 {formatDuration(node.replyWait.longest.waitMs)}
+                </span>
+                <span className="small muted">
+                  输出 <span title={`${fullNumber(node.replyWait.longest.outputTokens)} token`}>{shortNumber(node.replyWait.longest.outputTokens)}</span> token
+                  {node.replyWait.longest.durationMs !== null && ` · 整次回复 ${formatDuration(node.replyWait.longest.durationMs)}`}
+                </span>
+              </div>
+              <div className="small dim">
+                {formatFullDateTime(node.replyWait.longest.at)} 结束 · 共 {fullNumber(node.replyWait.replies)} 次回复
+                {node.replyWait.slowReplies > 0 && `，${node.replyWait.slowReplies} 次有超过 2 分钟没有输出`}
+              </div>
+            </div>
+          </div>
+        )}
+
         {(isMain || node.compactions.total > 0) && (
           <div className="insp-sec">
             <h3>上下文压缩</h3>

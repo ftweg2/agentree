@@ -60,7 +60,7 @@ test('从旧版本升级：旧库里记的是最后一次的目录，升级后�
   assert.equal(cwdOf(store), 'C:\\proj');
   assert.equal((store.db.prepare('SELECT COUNT(*) AS n FROM requests WHERE session_id = ?').get(sid) as { n: number }).n, 2, '重读不会重复计数');
   // 直接升级到当前版本（v4 增加了 agent_listings，同一次重读补上）
-  assert.equal((store.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 5);
+  assert.equal((store.db.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 6);
   store.close();
 });
 

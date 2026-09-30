@@ -1,16 +1,16 @@
-// CLAUDE.md 里 agentree 管理的 advisor 规则块。标记之外的内容一个字节都不动。
+// CLAUDE.md 里 agentree 管理的规则块（分工规则和 advisor 规则）。标记之外的内容一个字节都不动。
+// 标记沿用最早的 advisor-rule 名字，兼容已经写进用户文件的块。默认文字按方案生成，见 shared/rule.ts
+import { ADVISOR_RULE_TEXT } from '../../../shared/rule.ts';
 import { detectEol } from './text.ts';
 
 export const RULE_START = '<!-- agentree:advisor-rule:start -->';
 export const RULE_END = '<!-- agentree:advisor-rule:end -->';
 
-export const DEFAULT_RULE_TEXT = [
-  '## 何时咨询 advisor',
-  '',
-  '- 动手做一个大的计划之前，先问 advisor 这个方向对不对',
-  '- 同一个错误第二次出现时，问 advisor 是不是走错了路',
-  '- 宣布一个耗时长的任务完成之前，问 advisor 有没有遗漏',
-].join('\n');
+/**
+ * 兜底文字：只在配置页手动启用规则（claudeMd.rule 不带正文）、而已保存的方案里既没有子 agent 也没有 advisor 时使用。
+ * 其余情况的默认文字都按方案生成（shared/rule.ts 的 defaultRuleText）
+ */
+export const FALLBACK_RULE_TEXT = ADVISOR_RULE_TEXT;
 
 export class RuleBlockError extends Error {}
 

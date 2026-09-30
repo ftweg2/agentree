@@ -1,13 +1,5 @@
 // 一致性检查：预设 vs 日志里的实际运行值。纯函数。
-import type {
-  CheckLevel,
-  Conformance,
-  ConformanceCheck,
-  ConformanceVerdict,
-  Preset,
-  PresetAgent,
-  SchemeRef,
-} from '../../shared/types.ts';
+import type { CheckLevel, Conformance, ConformanceCheck, ConformanceVerdict, Preset, PresetAgent, SchemeRef } from '../../shared/types.ts';
 import path from 'node:path';
 import { BUILTIN_AGENT_TYPES, EFFORT_ORDER } from './config.ts';
 
@@ -52,9 +44,7 @@ export function matchModel(expected: string, actual: string): ModelMatch {
     return { level: 'fail', reason: `预设是 ${e} 系列，实际用的是 ${actual}` };
   }
   if (e === a) {
-    const note = normalizeModel(actual) !== actual.trim().toLowerCase() || normalizeModel(expected) !== expected.trim().toLowerCase()
-      ? '（忽略了 [1m] 或日期后缀）'
-      : '';
+    const note = normalizeModel(actual) !== actual.trim().toLowerCase() || normalizeModel(expected) !== expected.trim().toLowerCase() ? '（忽略了 [1m] 或日期后缀）' : '';
     return { level: 'ok', reason: `实际模型与预设一致${note}` };
   }
   const fe = modelFamily(e);
@@ -76,12 +66,7 @@ export function worst(levels: CheckLevel[]): CheckLevel {
  * 模型检查。models 为该 agent 实际用过的模型（按请求数从多到少），primary 为请求最多的模型。
  * inheritFrom：预设为 inherit 时继承的模型（主会话的主模型）。
  */
-export function checkModel(
-  expected: string | null,
-  models: string[],
-  primary: string | null,
-  inheritFrom: string | null = null,
-): ConformanceCheck | null {
+export function checkModel(expected: string | null, models: string[], primary: string | null, inheritFrom: string | null = null): ConformanceCheck | null {
   if (expected === null || expected === undefined || expected === '') return null;
   let exp = expected;
   let inheritNote = '';
@@ -135,9 +120,7 @@ export function checkEffort(expected: string | null, efforts: string[]): Conform
       parts.push(`${a} 无法与预设 ${expected} 比较高低`);
     } else if (ar < er) {
       levels.push('warn');
-      parts.push(
-        `${a} 低于预设 ${expected}：可能是模型不支持该级别被自动降级，或被环境变量 CLAUDE_CODE_EFFORT_LEVEL 覆盖`,
-      );
+      parts.push(`${a} 低于预设 ${expected}：可能是模型不支持该级别被自动降级，或被环境变量 CLAUDE_CODE_EFFORT_LEVEL 覆盖`);
     } else {
       levels.push('fail');
       parts.push(`${a} 高于预设 ${expected}`);
@@ -203,12 +186,11 @@ export function overlayPreset(global: Preset, project: Preset): Preset {
 /**
  * 给一个会话确定方案：属于某个项目方案 -> 叠加后的方案；否则全局方案有内容 -> 全局；否则 none（仍返回空的全局方案）
  */
-export function schemeForSession(
-  cwd: string | null,
-  global: Preset,
-  projects: Array<{ projectCwd: string; preset: Preset }>,
-): { ref: SchemeRef; preset: Preset } {
-  const owner = owningProject(cwd, projects.map((p) => p.projectCwd));
+export function schemeForSession(cwd: string | null, global: Preset, projects: Array<{ projectCwd: string; preset: Preset }>): { ref: SchemeRef; preset: Preset } {
+  const owner = owningProject(
+    cwd,
+    projects.map((p) => p.projectCwd),
+  );
   if (owner !== null) {
     const proj = projects.find((p) => p.projectCwd === owner)!;
     return { ref: { scope: 'project', projectCwd: owner }, preset: overlayPreset(global, proj.preset) };
@@ -233,6 +215,43 @@ export interface ActualAgent {
   models: string[];
   primaryModel: string | null;
   efforts: string[];
+  /** 父节点的 agent 类型（父节点是主会话时为 null） */
+  parentAgentType?: string | null;
+  /** 派发时传给 Agent 工具的 model 参数；没传为 null */
+  requestedModel?: string | null;
+}
+
+/**
+ * 派发时传的 model 参数和方案要求的是否算同一个：别名能匹配这个系列的完整 ID，反过来要求写完整 ID、实际传别名也算
+ * （Agent 工具的 model 参数本来就常传别名）
+ */
+export function sameDispatchModel(expected: string, actual: string): boolean {
+  if (matchModel(expected, actual).level === 'ok') return true;
+  return isAlias(actual) && matchModel(actual, expected).level === 'ok';
+}
+
+/**
+ * 父 agent 在方案里指定了往下派发的模型（dispatchModel）时，核对这次派发实际传的 model 参数。
+ * 这是写在父 agent 提示词里的要求、不是硬性限制，所以不符合只给 warn，不判为不符合方案。
+ * 父节点是主会话、父 agent 不在方案里、没指定或是内置类型（写不进定义文件）时返回 null
+ */
+export function checkDispatch(preset: Preset, parentAgentType: string | null | undefined, requestedModel: string | null | undefined): ConformanceCheck | null {
+  const parent = findPresetAgent(preset, parentAgentType ?? null);
+  const expected = parent?.dispatchModel;
+  if (!parent || typeof expected !== 'string' || BUILTIN_AGENT_TYPES.some((b) => b.toLowerCase() === parent.name.toLowerCase())) return null;
+  const actual = requestedModel ?? null;
+  const head = `父 agent ${parent.name} 的提示词要求派发时传 ${expected}`;
+  if (actual === null) {
+    return {
+      field: 'dispatch',
+      level: 'warn',
+      expected,
+      actual: null,
+      message: `${head}，这次没传 model 参数（下一层按自己定义里的模型或主会话的模型运行）。这是提示词里的要求，模型不一定照做`,
+    };
+  }
+  if (sameDispatchModel(expected, actual)) return { field: 'dispatch', level: 'ok', expected, actual, message: `${head}，这次传的正是 ${actual}` };
+  return { field: 'dispatch', level: 'warn', expected, actual, message: `${head}，这次传的是 ${actual}。这是提示词里的要求，模型不一定照做` };
 }
 
 /** 单个子 agent 的一致性 */
@@ -241,12 +260,16 @@ export function subagentConformance(preset: Preset, a: ActualAgent, mainPrimaryM
   const checks: ConformanceCheck[] = [];
   const pa = findPresetAgent(preset, a.agentType);
   const type = a.agentType ?? '（未知类型）';
+  // 派发它的父 agent 有没有按方案要求传 model 参数：和它自己的类型在不在方案里无关，放在最后
+  const dc = checkDispatch(preset, a.parentAgentType, a.requestedModel);
   if (pa) {
     checks.push({ field: 'agent', level: 'ok', expected: pa.name, actual: a.agentType, message: `agent 类型 ${type} 在预设中` });
     const mc = checkModel(pa.model, a.models, a.primaryModel, mainPrimaryModel);
     if (mc) checks.push(mc);
     const ec = checkEffort(pa.effort, a.efforts);
     if (ec) checks.push(ec);
+    // dispatch 只会是 ok 或 warn，不会让它变成不符合
+    if (dc) checks.push(dc);
     return { verdict: verdictOf(checks, false), presetAgent: pa.name, checks };
   }
   const builtin = a.agentType !== null && BUILTIN_AGENT_TYPES.includes(a.agentType);
@@ -258,6 +281,7 @@ export function subagentConformance(preset: Preset, a: ActualAgent, mainPrimaryM
       actual: a.agentType,
       message: `${type} 是内置类型，预设允许使用内置类型，不做模型和 effort 检查`,
     });
+    if (dc) checks.push(dc);
     // 预设允许内置类型即视为符合计划
     return { verdict: 'match', presetAgent: null, checks };
   }
@@ -266,10 +290,9 @@ export function subagentConformance(preset: Preset, a: ActualAgent, mainPrimaryM
     level: 'fail',
     expected: preset.agents.map((x) => x.name).join(', ') || null,
     actual: a.agentType,
-    message: builtin
-      ? `${type} 是内置类型，但预设不允许使用内置类型`
-      : `agent 类型 ${type} 不在预设里，属于计划外派发`,
+    message: builtin ? `${type} 是内置类型，但预设不允许使用内置类型` : `agent 类型 ${type} 不在预设里，属于计划外派发`,
   });
+  if (dc) checks.push(dc);
   return { verdict: 'unplanned', presetAgent: null, checks };
 }
 

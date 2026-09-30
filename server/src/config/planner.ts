@@ -4,23 +4,15 @@ import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import type { Node as JsonNode } from 'jsonc-parser';
-import type {
-  AgentFields,
-  ChangePlan,
-  CheckLevel,
-  ConfigAction,
-  EnvCheck,
-  FileChange,
-  PlanNote,
-  Preset,
-  PresetAgent,
-} from '../../../shared/types.ts';
+import type { AgentFields, ChangePlan, CheckLevel, ConfigAction, EnvCheck, FileChange, PlanNote, Preset, PresetAgent } from '../../../shared/types.ts';
 import { AUTO_COMPACT_MAX, AUTO_COMPACT_MIN, BUILTIN_AGENT_TYPES, claudeConfigDirs, formatWindow, isValidAutoCompactWindow } from '../config.ts';
 import { modelFamily, normalizeModel, MODEL_ALIASES } from '../conformance.ts';
 import { sameTools, validatePreset, type AppliedRecord, type EffortLocation, type WrittenEffort } from '../preset.ts';
+import { parseDispatch, withDispatch } from '../../../shared/dispatch.ts';
 import { getBackup } from './backups.ts';
-import { DEFAULT_RULE_TEXT, disableRule, enableRule, findRuleBlock, RuleBlockError } from './claudeMd.ts';
-import { FrontmatterError, getField, newAgentText, parseAgentDoc, serializeAgentDoc, setField, setPrompt, type AgentDoc } from './frontmatter.ts';
+import { defaultRuleText } from '../../../shared/rule.ts';
+import { disableRule, enableRule, FALLBACK_RULE_TEXT, findRuleBlock, RuleBlockError } from './claudeMd.ts';
+import { FrontmatterError, getField, newAgentText, parseAgentDoc, promptOf, serializeAgentDoc, setField, setPrompt, type AgentDoc } from './frontmatter.ts';
 import { JsonEditError, nodeAt, parseJsonDoc, removeValue, setValue } from './jsonEdit.ts';
 import {
   agentFilePath,
@@ -41,8 +33,7 @@ import { decodeUtf8, encodeText, readTextFile, sha256 } from './text.ts';
 export const PLAN_TTL_MS = 10 * 60_000;
 
 /** 计划提示：桌面版不读 settings.json 里的主模型和 effort（措辞集中在这里，方便以后调整） */
-export const PLAN_DESKTOP_MAIN_NOTE =
-  '桌面版不读配置文件里的主模型和 effort，每个会话用的是发送框旁边选择器里选的值。这次写入只对命令行和 VS Code 里启动的会话有效。';
+export const PLAN_DESKTOP_MAIN_NOTE = '桌面版不读配置文件里的主模型和 effort，每个会话用的是发送框旁边选择器里选的值。这次写入只对命令行和 VS Code 里启动的会话有效。';
 export const PLAN_DESKTOP_ADVISOR_NOTE = '桌面版是否读取配置文件里的 advisor 设置还没有验证。如果没有生效，可以在对话里输入 /advisor <模型> 来指定。';
 export const PLAN_DESKTOP_COMPACT_NOTE = '桌面版是否读取配置文件里的 autoCompactWindow 还没有验证。写入之后，搭建页的生效检查会根据实际压缩的时机告诉你有没有生效。';
 /** 设置文件里 autoCompactEnabled 为 false 时的提示 */
@@ -64,6 +55,11 @@ export interface PlanContext {
   desktopOnly?: boolean;
   /** 项目方案的应用记录（存在项目方案文件里）；prune 项目方案时用它，不用全局的 applied */
   projectApplied?: (projectCwd: string) => AppliedRecord | null;
+  /**
+   * 已保存的全局方案。规则的默认文字按方案生成：项目方案要叠加全局方案的子 agent，
+   * 配置页手动启用规则（claudeMd.rule 不带正文）按全局方案生成。缺失当作空方案
+   */
+  globalPreset?: () => Preset | null;
 }
 
 /** 计划的内部表示：比对外的 FileChange 多了要写入的原始字节 */
@@ -237,14 +233,19 @@ export function nextWrote(preset: Preset, applied: AppliedRecord | null, pruning
   };
 }
 
-/** 规则块实际使用的文案：空的或没给时用默认文案 */
-export function effectiveRuleText(text: unknown): string {
-  return typeof text === 'string' && text.trim() ? text : DEFAULT_RULE_TEXT;
+const EMPTY_PRESET: Preset = { version: 1, main: { model: null, effort: null, autoCompactWindow: null }, advisor: { model: null }, agents: [], allowBuiltins: true, updatedAt: null };
+
+/** 规则块实际使用的文字：给了非空的自定义文字就用它，否则用按方案生成的 autoText（可能是空字符串，表示不需要规则块） */
+export function effectiveRuleText(text: unknown, autoText: string): string {
+  return typeof text === 'string' && text.trim() ? text : autoText;
 }
 
 /** 正文比较用：忽略换行风格、开头的空行和末尾的空白行 */
 export function normalizePrompt(s: string): string {
-  return s.replace(/\r\n/g, '\n').replace(/^(?:[ \t]*\n)+/, '').replace(/\s+$/, '');
+  return s
+    .replace(/\r\n/g, '\n')
+    .replace(/^(?:[ \t]*\n)+/, '')
+    .replace(/\s+$/, '');
 }
 
 export function describeChange(key: string, before: string | null, after: string | null): string {
@@ -280,16 +281,63 @@ export function applyPresetAgent(doc: AgentDoc, pa: PresetAgent): { keys: string
     if (v !== null && hasField(doc, key) && sameTools(getField(doc, key), v)) continue;
     set(key, v);
   }
-  if (pa.prompt !== undefined && normalizePrompt(doc.body) !== normalizePrompt(pa.prompt)) {
+  const body = presetAgentBody(doc, pa);
+  if (body !== null) {
     // 沿用文件的换行风格；原正文和 frontmatter 之间空一行的，替换后也空一行
     const lead = doc.body === '' || /^[ \t]*\r?\n/.test(doc.body) ? doc.eol : '';
-    const text = pa.prompt.replace(/^(?:[ \t]*\r?\n)+/, '').replace(/\r?\n/g, doc.eol);
+    const text = body.text.replace(/^(?:[ \t]*\r?\n)+/, '').replace(/\r?\n/g, doc.eol);
     doc.body = lead + text + (text === '' || text.endsWith(doc.eol) ? '' : doc.eol);
     doc.closeEol = true;
-    keys.push('prompt');
-    labels.push('修改系统提示词');
+    if (body.promptChanged) {
+      keys.push('prompt');
+      labels.push('修改系统提示词');
+    }
+    if (body.dispatchChanged) {
+      keys.push('dispatchModel');
+      labels.push(describeDispatchChange(body.before, body.after));
+    }
   }
   return { keys, labels };
+}
+
+/** 往下派发的模型改动的中文说明 */
+function describeDispatchChange(before: string | null, after: string | null): string {
+  if (before === null) return `写入往下派发的模型 ${after}`;
+  if (after === null) return `删除往下派发的模型（原为 ${before}）`;
+  return `把往下派发的模型从 ${before} 改为 ${after}`;
+}
+
+/**
+ * 应用方案时定义文件正文（系统提示词 + 末尾的派发块，见 shared/dispatch.ts）应该变成什么。
+ *   prompt 缺失：提示词沿用文件里的；dispatchModel 缺失：块沿用（给的 prompt 里自带块时用它的，否则用文件里的），
+ *   null 删除块，字符串写成这个模型的块。
+ * 比较按"拆开后的提示词（忽略换行风格和首尾空行）+ 块里的模型"，所以读出来的内容原样提交不会有改动，
+ * 块不在末尾之类的写法只要内容相同也不动。不需要改时返回 null；返回的 text 换行统一为 \n
+ */
+export function presetAgentBody(doc: AgentDoc, pa: PresetAgent): { text: string; promptChanged: boolean; dispatchChanged: boolean; before: string | null; after: string | null } | null {
+  if (pa.prompt === undefined && pa.dispatchModel === undefined) return null;
+  const cur = parseDispatch(promptOf(doc).replace(/\r\n/g, '\n'));
+  const given = pa.prompt !== undefined ? parseDispatch(pa.prompt.replace(/\r\n/g, '\n')) : null;
+  const prompt = given ? given.prompt : cur.prompt;
+  const model = pa.dispatchModel !== undefined ? pa.dispatchModel : (given?.model ?? cur.model);
+  const promptChanged = normalizePrompt(prompt) !== normalizePrompt(cur.prompt);
+  const dispatchChanged = model !== cur.model;
+  if (!promptChanged && !dispatchChanged) return null;
+  // 不带块时提示词原样写（和以前一样保留它自己的末尾空行）
+  return { text: model === null ? prompt : withDispatch(prompt, model), promptChanged, dispatchChanged, before: cur.model, after: model };
+}
+
+/** agent 还能不能往下派发：disallowedTools 含 Agent，或 tools 有白名单且不含 Agent 时不能（tools 里 Agent(a,b) 这种写法也算含） */
+export function canDispatch(tools: string | null, disallowedTools: string | null): boolean {
+  const list = (v: string | null) =>
+    (v ?? '')
+      .split(',')
+      .map((t) => t.trim())
+      .filter(Boolean);
+  const isAgent = (t: string) => /^(Agent|Task)(\(|$)/.test(t);
+  if (list(disallowedTools).some((t) => t === 'Agent' || t === 'Task')) return false;
+  const allow = list(tools);
+  return allow.length === 0 || allow.some(isAgent);
 }
 
 /** 用户级定义：优先 <name>.md；否则找 frontmatter 里 name 相同的文件 */
@@ -328,10 +376,7 @@ export function findAgentFile(name: string, knownCwds: string[], projectCwd: str
  * modelKeys 为 settings.json 的 model / advisorModel，effort 为主会话或 agent 的 effort，
  * agentModel 为 agent 定义文件里的 model，advisor 为 advisorModel，compact 为 autoCompactWindow
  */
-export function envNotes(
-  ctx: Pick<PlanContext, 'env' | 'ccSwitchDetected'>,
-  inv: { modelKeys: boolean; effort: boolean; agentModel: boolean; advisor: boolean; compact?: boolean },
-): PlanNote[] {
+export function envNotes(ctx: Pick<PlanContext, 'env' | 'ccSwitchDetected'>, inv: { modelKeys: boolean; effort: boolean; agentModel: boolean; advisor: boolean; compact?: boolean }): PlanNote[] {
   const set = (name: string) => ctx.env.some((e) => e.name === name && e.value !== null);
   const out: PlanNote[] = [];
   if (ctx.ccSwitchDetected && inv.modelKeys) {
@@ -571,10 +616,16 @@ export class Planner {
     }
   }
 
-  rule(enabled: unknown, text: unknown) {
+  /**
+   * 启用 / 停用规则块。text 为 null 或空时用 autoText；autoText 缺失（配置页的 claudeMd.rule）时按已保存的全局方案生成，
+   * 全局方案里既没有子 agent 也没有 advisor 时用兜底的 advisor 三条
+   */
+  rule(enabled: unknown, text: unknown, autoText?: string) {
     if (typeof enabled !== 'boolean') throw new PlanError('enabled 必须是布尔值');
     if (text !== null && text !== undefined && typeof text !== 'string') throw new PlanError('规则正文必须是字符串或 null');
-    const ruleText = typeof text === 'string' && text.trim() ? text : DEFAULT_RULE_TEXT;
+    const auto = autoText ?? (defaultRuleText(this.ctx.globalPreset?.() ?? EMPTY_PRESET) || FALLBACK_RULE_TEXT);
+    const ruleText = effectiveRuleText(text, auto);
+    if (enabled && !ruleText.trim()) throw new PlanError('规则正文是空的');
     if (ruleText.includes('<!-- agentree:advisor-rule')) throw new PlanError('规则正文里不能包含 agentree 的标记');
     const f = this.file(this.claudeMdTarget());
     const current = f.text ?? '';
@@ -583,7 +634,7 @@ export class Planner {
     if (next !== current || (enabled && f.text === null)) {
       const had = findRuleBlock(current) !== null;
       f.text = next;
-      f.summaries.push(enabled ? (had ? '替换 advisor 规则块的内容' : '在末尾追加 advisor 规则块') : '删除 advisor 规则块');
+      f.summaries.push(enabled ? (had ? '替换 agentree 规则块的内容' : '在末尾追加 agentree 规则块') : '删除 agentree 规则块');
     }
   }
 
@@ -647,7 +698,11 @@ export class Planner {
       dest.summaries.push(`由 ${oldName}.md 改名而来${changed.length ? `，并${changed.join('、')}` : ''}`);
       source.text = null;
       source.summaries.push(`改名为 ${name}.md（原文件移到备份目录）`);
-      this.agentTouched(changed.some((c) => c.includes('model')), changed.some((c) => c.includes('effort')), true);
+      this.agentTouched(
+        changed.some((c) => c.includes('model')),
+        changed.some((c) => c.includes('effort')),
+        true,
+      );
       return;
     }
 
@@ -677,7 +732,11 @@ export class Planner {
     if (changed.length) {
       f.text = serializeAgentDoc(doc);
       f.summaries.push(changed.join('、'));
-      this.agentTouched(changed.some((c) => c.includes('model')), changed.some((c) => c.includes('effort')), false);
+      this.agentTouched(
+        changed.some((c) => c.includes('model')),
+        changed.some((c) => c.includes('effort')),
+        false,
+      );
     }
   }
 
@@ -745,7 +804,7 @@ export class Planner {
     const pruning = prune === true;
     const cwd = this.scopeCwd;
     // prune 用这个方案自己的应用记录：项目方案用项目的，全局方案用 applied.json
-    const applied = cwd === null ? this.ctx.applied ?? null : this.ctx.projectApplied?.(cwd) ?? null;
+    const applied = cwd === null ? (this.ctx.applied ?? null) : (this.ctx.projectApplied?.(cwd) ?? null);
     /** 这次会移除的东西，最后汇总成一条 info */
     const removed: string[] = [];
     if (preset.main.model) this.mainModel(preset.main.model);
@@ -795,6 +854,8 @@ export class Planner {
       const target = findAgentFile(pa.name, this.ctx.knownCwds, cwd);
       const f = this.file(target);
       this.lastAgentPath = target.path;
+      let tools: string | null;
+      let disallowedTools: string | null;
       if (f.text !== null) {
         // 已存在：只改预设里有定义的项，其余 frontmatter 字段、注释、顺序原样保留
         const doc = this.parseAgent(f);
@@ -804,25 +865,36 @@ export class Planner {
           f.summaries.push(labels.join('、'));
           this.agentTouched(keys.includes('model'), keys.includes('effort'), false);
         }
+        tools = getField(doc, 'tools');
+        disallowedTools = getField(doc, 'disallowedTools');
       } else {
-        this.createPresetAgent(f, pa);
+        ({ tools, disallowedTools } = this.createPresetAgent(f, pa));
+      }
+      // 指定了往下派发的模型，但工具设置不允许它再派发：照写，提醒一句
+      if (typeof pa.dispatchModel === 'string' && !canDispatch(tools, disallowedTools)) {
+        this.note('warn', `${pa.name} 不能再派发子 agent，往下派发的模型指定用不上`);
       }
     }
     if (includeRule === true) {
-      if (typeof ruleText === 'string') {
-        // 给了文案：没有规则块就追加，已有且文案不同就替换
-        this.rule(true, ruleText);
-      } else {
+      // 没给自定义文字时按方案生成（项目方案叠加已保存的全局方案）：没有规则块就追加，已有且文字不同就替换。
+      // 早先版本写的只有 advisor 三条的块也会因此换成带分工的新文字
+      const auto = defaultRuleText(preset, cwd === null ? null : (this.ctx.globalPreset?.() ?? null));
+      const text = effectiveRuleText(ruleText, auto);
+      if (text.trim()) this.rule(true, text, auto);
+      else {
+        // 方案里既没有子 agent 也没有 advisor：没有要写的规则，已有的 agentree 规则块删掉
         const f = this.file(this.claudeMdTarget());
-        const hasRule = f.text !== null && findRuleBlock(f.text) !== null;
-        if (!hasRule) this.rule(true, null);
+        if (f.text !== null && findRuleBlock(f.text) !== null) {
+          this.rule(false, null, auto);
+          removed.push('CLAUDE.md 里的 agentree 规则块（方案里没有子 agent 也没有 advisor，不需要规则）');
+        }
       }
     } else if (pruning) {
       // 规则块有 agentree 的标记，本来就是 agentree 管理的，prune 时直接删除
       const f = this.file(this.claudeMdTarget());
       if (f.text !== null && findRuleBlock(f.text) !== null) {
-        this.rule(false, null);
-        removed.push('CLAUDE.md 里的 advisor 规则块');
+        this.rule(false, null, '');
+        removed.push('CLAUDE.md 里的 agentree 规则块');
       }
     }
     if (removed.length) this.note('info', `这次会移除：${removed.join('、')}`);
@@ -830,14 +902,17 @@ export class Planner {
   }
 
   /** 预设里的 agent 还没有定义文件：按预设内容新建，缺的项用模板补 */
-  private createPresetAgent(f: WorkFile, pa: PresetAgent) {
+  private createPresetAgent(f: WorkFile, pa: PresetAgent): { tools: string | null; disallowedTools: string | null } {
     const t = agentTemplate(pa.name);
     const note = pa.note?.trim() ? pa.note.trim() : undefined;
     // description：预设 > 旧预设的 note > 模板
     const description = pa.description ?? note ?? t.description;
     const tools = pa.tools !== undefined ? pa.tools : t.tools;
     const disallowedTools = pa.disallowedTools !== undefined ? pa.disallowedTools : t.disallowedTools;
-    const body = pa.prompt !== undefined ? pa.prompt : t.prompt;
+    // 正文 = 提示词 + 派发块。dispatchModel 缺失时用提示词里自带的块（没有就不加）
+    const prompt = pa.prompt !== undefined ? pa.prompt : t.prompt;
+    const dispatchModel = pa.dispatchModel !== undefined ? pa.dispatchModel : parseDispatch(prompt).model;
+    const body = dispatchModel === null ? parseDispatch(prompt).prompt : withDispatch(prompt, dispatchModel);
     f.text = newAgentText(
       [
         ['name', pa.name],
@@ -856,13 +931,11 @@ export class Planner {
       if (pa.description === undefined && note === undefined) parts.push('描述');
       if (pa.prompt === undefined) parts.push('系统提示词');
       if (parts.length) {
-        this.note(
-          'warn',
-          `新建的 ${pa.name} 的${parts.join('和')}还是占位文字：主会话靠描述决定什么时候派发它，现在它不知道该什么时候用这个 agent。请在节点上填写后再应用`,
-        );
+        this.note('warn', `新建的 ${pa.name} 的${parts.join('和')}还是占位文字：主会话靠描述决定什么时候派发它，现在它不知道该什么时候用这个 agent。请在节点上填写后再应用`);
       }
     }
     this.agentTouched(pa.model !== null, pa.effort !== null, true);
+    return { tools, disallowedTools };
   }
 
   /** 从备份恢复：目标写成备份里的原始字节；备份时原文件不存在则删除 */
@@ -936,10 +1009,7 @@ export class Planner {
     if (projectCwd !== null) {
       this.note('info', `这份方案只对在 ${projectCwd} 下开始的会话生效。`);
       if (changes.some((c) => c.kind === 'create' && path.basename(c.filePath).toLowerCase() === 'settings.local.json')) {
-        this.note(
-          'info',
-          'settings.local.json 是你个人的设置，Claude Code 自己创建它时会让它不进版本库；这次是 agentree 创建的，如果这个项目用 git，请自己把它加进 .gitignore。',
-        );
+        this.note('info', 'settings.local.json 是你个人的设置，Claude Code 自己创建它时会让它不进版本库；这次是 agentree 创建的，如果这个项目用 git，请自己把它加进 .gitignore。');
       }
     }
     // advisor 与主模型的搭配（官方文档 advisor.md 的表格，只检查确定会被拒绝的组合）

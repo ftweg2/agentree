@@ -3,6 +3,7 @@ import type {
   AgentTypeUsage,
   ClaudeConfigSnapshot,
   DailyPoint,
+  EffectItem,
   IndexStatus,
   LiveSession,
   LiveState,
@@ -176,7 +177,8 @@ function live(): LiveState {
         lastActivityAt: d.summary.lastActivityAt,
         mainActive: main.status === 'running',
         mainModel: main.primaryModel,
-        mainTool: main.status === 'running' ? currentToolFor(main.id) : null,
+        mainTool: main.status === 'running' && !d.summary.awaitingReply ? currentToolFor(main.id) : null,
+        awaitingReply: d.summary.awaitingReply,
         requests: d.summary.requests,
         tokens: d.summary.tokens.total,
         agentCount: d.summary.agentCount,
@@ -237,11 +239,43 @@ function presetFromConfig(): Preset {
       name: d.name,
       model: d.model === 'inherit' ? null : d.model,
       effort: d.effort,
+      dispatchModel: store.dispatchModelOf(d.filePath),
       note: d.source === 'project' ? `项目级：${d.projectCwd ?? ''}` : '用户级',
     })),
     allowBuiltins: true,
     updatedAt: null,
   };
+}
+
+/**
+ * 每个指定了往下派发模型的子 agent 一项 agent-dispatch：
+ * 定义文件里还没有派发块时是"还没写入"；写入之后假装它派发过 3 次，其中 1 次没传这个模型
+ */
+function dispatchEffects(p: Preset): EffectItem[] {
+  const defs = store.definitions().filter((d) => d.source === 'user');
+  const out: EffectItem[] = [];
+  for (const a of p.agents ?? []) {
+    if (!a.dispatchModel || BUILTIN_TYPES.includes(a.name)) continue;
+    const def = defs.find((d) => d.name === a.name);
+    const actual = def ? store.dispatchModelOf(def.filePath) : null;
+    const state = actual === a.dispatchModel ? 'yes' : actual ? 'differs' : 'no';
+    const written = state === 'yes';
+    out.push({
+      key: `agent:${a.name}:dispatch`,
+      kind: 'agent-dispatch',
+      name: a.name,
+      expected: a.dispatchModel,
+      written: { state, filePath: def?.filePath ?? null, actual, diffs: state === 'differs' ? ['dispatchModel'] : [] },
+      loaded: { state: 'n/a', count: 0, lastSeenAt: null, lastSessionId: null },
+      observed: written
+        ? { state: 'mismatch', since: null, count: 3, matched: 2, actual: [a.dispatchModel, 'sonnet'], lastSeenAt: new Date(Date.now() - 40 * 60_000).toISOString(), lastSessionId: null }
+        : { state: 'not-seen', since: null, count: 0, matched: 0, actual: [], lastSeenAt: null, lastSessionId: null },
+      writeEffective: true,
+      summary: written ? `${a.name} 派发了 3 个子 agent，其中 1 个没传 ${a.dispatchModel}` : `${a.name} 的提示词里还没有往下派发的要求`,
+      nextStep: written ? null : '应用到 Claude Code，把要求写进它的定义文件',
+    });
+  }
+  return out;
 }
 
 function envWarnings(): PlanNote[] {
@@ -271,14 +305,15 @@ export async function mockRequest<T>(method: string, path: string, body?: unknow
 
   // 第二阶段
   if (method === 'GET' && p === '/api/config/agent') return store.agentDetail(url.searchParams.get('path') ?? '') as T;
-  if (method === 'GET' && p === '/api/config/rule') return store.ruleState() as T;
+  if (method === 'GET' && p === '/api/config/rule') return store.ruleState(preset) as T;
   if (method === 'GET' && p === '/api/config/templates') return store.templates() as T;
   if (method === 'GET' && p === '/api/config/agent-templates') return [] as T;
   // 返回空清单，前端会用内置的清单
   if (method === 'GET' && p === '/api/models') return [] as T;
-  // 模拟数据不做生效检查，返回空报告
+  // 模拟数据只做"往下派发的模型"这一项的生效检查，方便看界面；其他项不检查
   if (method === 'POST' && p === '/api/config/effect') {
-    return { generatedAt: new Date().toISOString(), scheme: { scope: 'user', projectCwd: null }, appliedAt: null, since: null, sessionsSince: 0, lastEntrypoint: null, items: [], blockers: [] } as T;
+    const items = dispatchEffects((body as { preset: Preset }).preset);
+    return { generatedAt: new Date().toISOString(), scheme: { scope: 'user', projectCwd: null }, appliedAt: null, since: null, sessionsSince: 0, lastEntrypoint: null, items, blockers: [] } as T;
   }
   if (method === 'GET' && p === '/api/config/backups') return store.backupList() as T;
   if (method === 'POST' && p === '/api/config/plan') {

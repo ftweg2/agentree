@@ -3,7 +3,7 @@ import { Link } from 'react-router-dom';
 import type { LiveAgent, LiveSession, LiveState } from '../types';
 import { api } from '../api/client';
 import { useApi, useNow } from '../lib/useApi';
-import { fullNumber, relativeTime, projectLabel, shortDuration, toolLabel } from '../lib/format';
+import { awaitingMinutes, fullNumber, relativeTime, projectLabel, shortDuration, toolLabel } from '../lib/format';
 import { ErrorBox, Flash, ModelTag, Skeleton, Tok } from '../components/ui';
 
 /** 按 parentId 把运行中的 agent 排成树序；父节点不在运行列表里的直接放顶层 */
@@ -49,6 +49,8 @@ function SessionCard({ s, now }: { s: LiveSession; now: number }) {
   const agents = orderAgents(s.runningAgents);
   const minDepth = agents.length ? Math.min(...agents.map((a) => a.depth)) : 1;
   const busy = s.mainActive || agents.length > 0;
+  // 在等模型回复超过 1 分钟：高强度下模型会先思考很久，这段时间日志里没有任何输出
+  const awaitMin = awaitingMinutes(s.awaitingReply?.since, now);
   return (
     <Link to={`/sessions/${encodeURIComponent(s.sessionId)}`} className={`card live-card ${busy ? 'active' : ''}`}>
       <div className="card-h" style={{ alignItems: 'flex-start', borderBottom: 'none' }}>
@@ -76,9 +78,19 @@ function SessionCard({ s, now }: { s: LiveSession; now: number }) {
         <span className="mono" style={{ fontWeight: 600, whiteSpace: 'nowrap' }}>
           主会话
         </span>
-        <span className="muted ellipsis" style={{ flex: 1, minWidth: 0 }}>
-          {s.mainActive ? '正在工作' : agents.length ? '等待子 agent 返回' : '暂时没有写入'}
-        </span>
+        {awaitMin !== null ? (
+          <span
+            className="ellipsis"
+            style={{ flex: 1, minWidth: 0, color: 'var(--running)' }}
+            title="最后一条是用户消息或工具结果，模型还没有回复。高强度下模型会先思考很久，思考完成之前日志里没有任何输出，这不是卡死"
+          >
+            已等待回复 {awaitMin} 分钟 · 模型可能还在思考
+          </span>
+        ) : (
+          <span className="muted ellipsis" style={{ flex: 1, minWidth: 0 }}>
+            {s.mainActive ? '正在工作' : agents.length ? '等待子 agent 返回' : '暂时没有写入'}
+          </span>
+        )}
         <ModelTag model={s.mainModel} />
         <ToolChip tool={s.mainTool} />
       </div>

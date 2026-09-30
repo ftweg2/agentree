@@ -14,7 +14,7 @@ process.env.AGENTREE_HOME = path.join(root, 'home');
 fs.mkdirSync(path.join(cfg, 'agents'), { recursive: true });
 
 const { makePlan, isOpus55OrLater } = await import('../src/config/planner.ts');
-const { PRESET_TEMPLATES, agentTemplate } = await import('../src/config/templates.ts');
+const { agentTemplate } = await import('../src/config/templates.ts');
 const { applyPlan } = await import('../src/config/applier.ts');
 
 const ctx = (env: Array<{ name: string; value: string | null }> = [], cc = false, desktopOnly = true) => ({
@@ -36,8 +36,15 @@ test('Opus 5.5 及之后的判断', () => {
 });
 
 test('模板预设：settings.json、CLAUDE.md、三个 agent 定义，同一文件的多项修改合并；给出桌面版提示', async () => {
-  const t = PRESET_TEMPLATES[0];
-  assert.equal(t.id, 'opus-main-fable-advisor');
+  // 主模型、顾问、三个子 agent 都有的方案（早期的内置模板就是这个组合），用来覆盖"同一文件的多项修改合并"
+  const ta = (name: string) => {
+    const x = agentTemplate(name);
+    return { name, model: 'opus', effort: 'medium', description: x.description, tools: x.tools, disallowedTools: x.disallowedTools, prompt: x.prompt };
+  };
+  const t = {
+    preset: { version: 1 as const, main: { model: 'claude-opus-5-5', effort: 'high', autoCompactWindow: null }, advisor: { model: 'fable' }, agents: [ta('explorer'), ta('worker'), ta('researcher')], allowBuiltins: true, updatedAt: null },
+    includeRule: true,
+  };
   // 模板里的 agent 带着完整内容（description、tools、prompt）
   const ex = agentTemplate('explorer');
   // 已存在的 explorer：改 model、effort，以及模板带来的 description、tools、正文；其余字段（color）不动

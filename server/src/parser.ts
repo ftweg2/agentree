@@ -25,6 +25,38 @@ export interface RequestRow {
   advisorModel: string | null;
   usage: UsageNums;
   advisor: AdvisorIter[];
+  /**
+   * 这次回复的"等待起点"：第一块内容之前最近的一条用户记录（用户消息、工具结果）或上一次回复的块的时间。
+   * 不知道时为 null
+   */
+  promptTs: string | null;
+  /** 这次回复最后一块完成的时间；减去 promptTs 就是整次回复的耗时 */
+  endTs: string | null;
+  /**
+   * 这次回复里最长的一段没有输出的时间（毫秒）：起点到第一块、以及相邻两块之间（中间夹着的工具结果也算一条记录）的最大间隔。
+   * 思考块完成之前日志里什么都没有，所以长思考表现为块和块之间的一段沉默。不知道时为 null
+   */
+  maxGapMs: number | null;
+  /** 最长那段沉默结束的时间（结束它的那一块的时间） */
+  gapTs: string | null;
+}
+
+/** 用户按中断时程序写入的标记（type 为 user、内容为 [Request interrupted by user...]），只记时间，不保留内容 */
+export interface InterruptRow {
+  /** 去重键：记录的 uuid；没有时退回时间戳 */
+  key: string;
+  ts: string | null;
+  /** 中断前已经等了多久（毫秒）：中断标记的时间 - 它之前最近的一条用户记录或回复块的时间。不知道时为 null */
+  waitMs: number | null;
+}
+
+/** 两个时间戳之差（毫秒）；任一无效或为负时为 null */
+function gapMs(from: string | null | undefined, to: string | null): number | null {
+  if (!from || !to) return null;
+  const a = Date.parse(from);
+  const b = Date.parse(to);
+  if (Number.isNaN(a) || Number.isNaN(b) || b < a) return null;
+  return b - a;
 }
 
 export interface ToolUseRow {
@@ -168,8 +200,22 @@ export function mergeRequest(a: RequestRow, b: RequestRow): RequestRow {
     advisorModel: a.advisorModel ?? b.advisorModel,
     usage: maxUsage(a.usage, b.usage),
     advisor: [...advisor.values()].sort((x, y) => x.idx - y.idx),
+    // 起点取较早的（第一块之前的那条记录），结束取较晚的
+    promptTs: a.promptTs && b.promptTs ? (a.promptTs < b.promptTs ? a.promptTs : b.promptTs) : a.promptTs ?? b.promptTs,
+    endTs: a.endTs && b.endTs ? (a.endTs > b.endTs ? a.endTs : b.endTs) : a.endTs ?? b.endTs,
+    ...(b.maxGapMs !== null && (a.maxGapMs === null || b.maxGapMs > a.maxGapMs) ? { maxGapMs: b.maxGapMs, gapTs: b.gapTs } : { maxGapMs: a.maxGapMs, gapTs: a.gapTs }),
   };
 }
+
+const INTERRUPT_RE = /^\[Request interrupted by user[^\]]*\]$/;
+
+/** 是否是用户按中断时程序写入的标记（两种写法：[Request interrupted by user] 和 [Request interrupted by user for tool use]） */
+export function isInterruptText(text: string): boolean {
+  return INTERRUPT_RE.test(text.trim());
+}
+
+/** 本地命令和 ! 命令的输出：写完之后不会有模型回复 */
+const LOCAL_OUTPUT_RE = /^\s*<(local-command-stdout|local-command-stderr|bash-stdout|bash-stderr)>/;
 
 const NOTIF_RE = /<task-notification>([\s\S]*?)<\/task-notification>/g;
 const TASK_ID_RE = /<task-id>\s*([^<\s]+)\s*<\/task-id>/;
@@ -209,21 +255,36 @@ function titleFromPrompt(text: string): string | null {
 }
 
 /**
- * 文件末尾"还在等结果的 tool_use"状态，跨增量读取延续。
+ * 文件末尾的状态，跨增量读取延续（存在 files.pending_tools 里）。
  * msg 为发出这些 tool_use 的 assistant 消息 id，ids 为还没拿到 tool_result 的 tool_use id。
+ * 后三项是回复计时用的，旧数据里没有，按 null 处理。
  */
 export interface PendingTools {
   msg: string | null;
   ids: string[];
+  /** 最近一条用户记录或回复块的时间：下一次新回复的等待起点 */
+  anchor?: string | null;
+  /** 最近一次回复的去重键；同一次回复后面的块不重新取起点 */
+  reply?: string | null;
+  /** 最后一条有效记录是用户消息或工具结果、之后还没有回复时，这条记录的时间；否则为 null */
+  awaiting?: string | null;
 }
 
 export function parsePending(s: string | null | undefined): PendingTools {
-  if (!s) return { msg: null, ids: [] };
+  const empty = { msg: null, ids: [], anchor: null, reply: null, awaiting: null };
+  if (!s) return empty;
   try {
     const o = JSON.parse(s);
-    return { msg: typeof o.msg === 'string' ? o.msg : null, ids: Array.isArray(o.ids) ? o.ids.filter((x: unknown) => typeof x === 'string') : [] };
+    const sv = (v: unknown) => (typeof v === 'string' ? v : null);
+    return {
+      msg: sv(o.msg),
+      ids: Array.isArray(o.ids) ? o.ids.filter((x: unknown) => typeof x === 'string') : [],
+      anchor: sv(o.anchor),
+      reply: sv(o.reply),
+      awaiting: sv(o.awaiting),
+    };
   } catch {
-    return { msg: null, ids: [] };
+    return empty;
   }
 }
 
@@ -236,6 +297,7 @@ export class LineBatch {
   notifications: NotificationRow[] = [];
   listings: ListingDelta[] = [];
   compactions: CompactionRow[] = [];
+  interrupts: InterruptRow[] = [];
   session: SessionPatch = {
     cwd: null,
     entrypoint: null,
@@ -254,7 +316,7 @@ export class LineBatch {
 
   constructor(isMain: boolean, pending: PendingTools = { msg: null, ids: [] }) {
     this.isMain = isMain;
-    this.pending = { msg: pending.msg, ids: [...pending.ids] };
+    this.pending = { msg: pending.msg, ids: [...pending.ids], anchor: pending.anchor ?? null, reply: pending.reply ?? null, awaiting: pending.awaiting ?? null };
   }
 
   /** 最后一条记录是否是还没拿到结果的 tool_use */
@@ -270,6 +332,7 @@ export class LineBatch {
       this.notifications.length === 0 &&
       this.listings.length === 0 &&
       this.compactions.length === 0 &&
+      this.interrupts.length === 0 &&
       this.minTs === null &&
       this.badLines === 0 &&
       Object.values(this.session).every((v) => v === null)
@@ -369,6 +432,15 @@ export class LineBatch {
         }
       }
     }
+    // 回复计时：一次回复的第一块取等待起点，同一回复后面的块不再取（旧版本主文件里混写的子 agent 记录不参与）
+    const timed = !(this.isMain && o.isSidechain === true);
+    let promptTs: string | null = null;
+    // 这一块和前一条记录（用户记录或回复块）之间的沉默
+    const gap = key && timed ? gapMs(this.pending.anchor, ts) : null;
+    if (key && timed && key !== this.pending.reply) {
+      promptTs = this.pending.anchor ?? null;
+      this.pending.reply = key;
+    }
     if (key) {
       const row: RequestRow = {
         key,
@@ -378,13 +450,21 @@ export class LineBatch {
         advisorModel: str(o.advisorModel),
         usage: readUsage(usageObj),
         advisor,
+        promptTs,
+        endTs: ts,
+        maxGapMs: gap,
+        gapTs: gap !== null ? ts : null,
       };
       const prev = this.requests.get(key);
       this.requests.set(key, prev ? mergeRequest(prev, row) : row);
     }
     // 同一条 assistant 消息会拆成多行写入（thinking、text、tool_use 各一行）：同一消息累加，新消息重置
     const msgId = str(msg.id) ?? str(o.requestId) ?? str(o.uuid);
-    if (msgId !== this.pending.msg) this.pending = { msg: msgId, ids: [] };
+    if (msgId !== this.pending.msg) this.pending = { ...this.pending, msg: msgId, ids: [] };
+    if (timed) {
+      if (ts) this.pending.anchor = ts;
+      this.pending.awaiting = null;
+    }
     if (Array.isArray(msg.content)) {
       for (const b of msg.content) {
         const bo = obj(b);
@@ -431,18 +511,34 @@ export class LineBatch {
     }
     const texts = textsOf(content);
     for (const t of texts) this.onNotificationText(t, ts);
+    const interrupted = texts.some(isInterruptText);
+    if (!(this.isMain && o.isSidechain === true)) {
+      // 中断标记：同一批里重复的键只记一次，跨批次靠数据库主键去重
+      if (interrupted) {
+        const key = str(o.uuid) ?? (ts ? `ts:${ts}` : `line:${this.lines}`);
+        if (!this.interrupts.some((x) => x.key === key)) this.interrupts.push({ key, ts, waitMs: gapMs(this.pending.anchor, ts) });
+      }
+      // 回复计时：用户记录都算下一次回复的等待起点
+      if (ts) this.pending.anchor = ts;
+      // 是否在等回复：用户消息、工具结果之后在等；中断、压缩摘要、本地命令的输出之后不会有回复；isMeta 的记录不改变状态
+      if (!o.isMeta) {
+        if (interrupted || o.isCompactSummary === true || (texts.length > 0 && texts.every((t) => LOCAL_OUTPUT_RE.test(t)))) this.pending.awaiting = null;
+        else this.pending.awaiting = ts ?? this.pending.awaiting ?? null;
+      }
+    }
     // 等待中的 tool_use：拿到结果就移除；用户发了新消息（含中断）则清空
     if (!o.isMeta) {
       const resultIds = Array.isArray(content)
         ? content.map(obj).filter((b) => b && b.type === 'tool_result' && typeof b.tool_use_id === 'string').map((b) => b!.tool_use_id as string)
         : [];
       if (resultIds.length) this.pending.ids = this.pending.ids.filter((id) => !resultIds.includes(id));
-      else if (texts.length) this.pending = { msg: null, ids: [] };
+      else if (texts.length) this.pending = { ...this.pending, msg: null, ids: [] };
     }
     if (this.isMain && this.session.firstPrompt === null && !o.isMeta && !o.isCompactSummary && !r) {
       const origin = obj(o.origin);
       if (!origin || origin.kind === undefined || origin.kind === 'human' || origin.kind === 'user') {
         for (const t of texts) {
+          if (isInterruptText(t)) continue;
           const title = titleFromPrompt(t);
           if (title) {
             this.session.firstPrompt = title;

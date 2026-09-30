@@ -4,28 +4,20 @@
 // observed 用索引数据库（经 Analyzer 还原会话树），不重新解析日志；模型和 effort 是否符合沿用 conformance.ts 的判断。
 // 返回内容里不放提示词正文和对话正文，actual 只放模型名、effort 值之类的短文本。
 import path from 'node:path';
-import type {
-  EffectItem,
-  EffectKind,
-  EffectLoaded,
-  EffectObserved,
-  EffectReport,
-  EffectWritten,
-  PlanNote,
-  Preset,
-  PresetAgent,
-  SessionDetail,
-} from '../../shared/types.ts';
+import type { EffectItem, EffectKind, EffectLoaded, EffectObserved, EffectReport, EffectWritten, PlanNote, Preset, PresetAgent, SessionDetail } from '../../shared/types.ts';
+import { parseDispatch } from '../../shared/dispatch.ts';
+import { defaultRuleText, DIVISION_HEADING, ruleSummary } from '../../shared/rule.ts';
 import type { Analyzer } from './aggregate.ts';
 import { BUILTIN_AGENT_TYPES, claudeConfigDirs, formatWindow } from './config.ts';
-import { checkEffort, checkModel, matchModel, normalizeDir, normalizeModel, owningProject } from './conformance.ts';
+import { checkEffort, checkModel, matchModel, normalizeDir, normalizeModel, owningProject, sameDispatchModel } from './conformance.ts';
 import type { Store } from './db.ts';
 import { enableRule, findRuleBlock, RuleBlockError } from './config/claudeMd.ts';
-import { parseAgentDoc } from './config/frontmatter.ts';
+import { getField, parseAgentDoc, promptOf } from './config/frontmatter.ts';
 import { nodeAt, parseJsonDoc, type JsonDoc } from './config/jsonEdit.ts';
 import { isConfigDirProject, isKnownProjectCwd, PathError, projectClaudeMdPath, projectSettingsPath, validateAgentName } from './config/paths.ts';
 import {
   applyPresetAgent,
+  canDispatch,
   effectiveRuleText,
   effortPath,
   envNotes,
@@ -74,6 +66,7 @@ export function effectText(hasSince: boolean) {
     compactNotReached: `已写入。${after}还没有会话的上下文达到过阈值，暂时看不出有没有生效。`,
     compactWait: (x: string) => `继续正常使用。等某个会话的上下文超过 ${x} token 之后，这里会显示它是不是在阈值附近压缩的。`,
     compactDesktopUnverified: '已写入配置文件。桌面版是否读取这个设置还没有验证。',
+    compactSubagents: (n: number) => `其中 ${n} 次发生在子 agent 的对话里（阈值同时管主对话和子 agent）。`,
     ruleAdvisorCalls: (n: number) => `${after} advisor 被调用了 ${n} 次。`,
     agentLoadedUnknown: '已写入。新开一个会话后，这里会显示它有没有被加载。',
     agentNotLoaded: `已写入，但${after}的会话都没有加载它。`,
@@ -92,6 +85,16 @@ export function effectText(hasSince: boolean) {
     builtinPrefix: (name: string) => `${name} 是内置类型，不需要写入。`,
     agentOverride: '主会话派发时可以另外指定模型，那样会盖过定义文件里的设置。到会话页查看那次派发的详情。',
     fixRuleMarkers: '请先手动修复 CLAUDE.md 里 agentree 的规则标记，再点"应用"。',
+    // 往下派发的模型：写在子 agent 提示词里的要求，不是硬性限制
+    dispatchNotWritten: '还没有写入。',
+    dispatchDiffers: (actual: string, x: string) => `定义文件里写的往下派发模型是 ${actual}，方案是 ${x}。`,
+    dispatchBuiltin: (name: string) => `${name} 是内置类型，没有定义文件，往下派发的模型写不进去。`,
+    dispatchNotSeen: `已写入。它${after}还没有往下派发过子 agent，暂时看不出有没有照做。`,
+    dispatchWait: '这是写在它提示词里的要求，不是硬性限制。等它往下派发过子 agent，这里会显示它每次传的模型。',
+    dispatchMatch: (n: number, x: string) => `已写入。${after}它派发了 ${n} 次，都按要求传了 ${x}。`,
+    dispatchMismatch: (n: number, bad: number, actual: string, x: string) => `已写入，但${after}它派发的 ${n} 次里有 ${bad} 次传的是 ${actual}，不是 ${x}。这是提示词里的要求，模型不一定照做。`,
+    dispatchStricter: '可以把它提示词里的要求写得更明确，或者到会话页查看那几次派发。',
+    dispatchCannot: ' 但它的工具设置不允许再派发子 agent，这个要求用不上。',
   };
 }
 
@@ -107,6 +110,7 @@ const FIELD_LABEL: Record<string, string> = {
   tools: '工具白名单',
   disallowedTools: '工具黑名单',
   prompt: '系统提示词',
+  dispatchModel: '往下派发的模型',
 };
 
 // ---------------- 输入 ----------------
@@ -237,17 +241,17 @@ class Sessions {
 
   /** 最近的会话是否全部来自桌面版：取起点之后开始的会话；没有就取索引里最近的 20 个。索引里没有会话时为 false */
   desktopOnly(): boolean {
-    const recent = this.startedSince.length
-      ? this.startedSince
-      : [...this.rows].sort((a, b) => (tsMs(b.last) ?? 0) - (tsMs(a.last) ?? 0)).slice(0, 20);
+    const recent = this.startedSince.length ? this.startedSince : [...this.rows].sort((a, b) => (tsMs(b.last) ?? 0) - (tsMs(a.last) ?? 0)).slice(0, 20);
     return recent.length > 0 && recent.every((r) => r.entrypoint === 'claude-desktop');
   }
 
   /** 起点之后，统计范围内的会话是否有任何活动（有 assistant 请求） */
   hasActivity(): boolean {
-    const rows = (this.sinceMs === null
-      ? this.store.db.prepare('SELECT DISTINCT session_id AS sid FROM requests').all()
-      : this.store.db.prepare('SELECT DISTINCT session_id AS sid FROM requests WHERE ts >= ?').all(new Date(this.sinceMs).toISOString())) as Array<{ sid: string }>;
+    const rows = (
+      this.sinceMs === null
+        ? this.store.db.prepare('SELECT DISTINCT session_id AS sid FROM requests').all()
+        : this.store.db.prepare('SELECT DISTINCT session_id AS sid FROM requests WHERE ts >= ?').all(new Date(this.sinceMs).toISOString())
+    ) as Array<{ sid: string }>;
     const inScope = new Set(this.rows.map((r) => r.sid));
     return rows.some((r) => inScope.has(r.sid));
   }
@@ -333,7 +337,7 @@ export function effectReport(input: EffectInput, deps: EffectDeps): EffectReport
     projectCwd = input.projectCwd;
   }
   // 这份方案自己的应用记录：项目方案用项目的，全局方案用 applied.json
-  const applied: AppliedRecord | null = projectCwd === null ? deps.ctx.applied ?? null : deps.ctx.projectApplied?.(projectCwd) ?? null;
+  const applied: AppliedRecord | null = projectCwd === null ? (deps.ctx.applied ?? null) : (deps.ctx.projectApplied?.(projectCwd) ?? null);
   const since = applied?.appliedAt ?? preset.updatedAt ?? null;
   // 没有起点时统计全部历史，措辞里不说"之后"
   const T = effectText(since !== null);
@@ -385,7 +389,11 @@ export function effectReport(input: EffectInput, deps: EffectDeps): EffectReport
   // ---------- 主模型 ----------
   {
     const expected = preset.main.model;
-    const w = settingsWritten(expected, ['model'], decisions.find((t) => t.item === 'model'));
+    const w = settingsWritten(
+      expected,
+      ['model'],
+      decisions.find((t) => t.item === 'model'),
+    );
     const samples: Sample[] = [];
     for (const r of sessions.startedSince) {
       if (sessions.takenOverMain(r.sid, 'model')) continue;
@@ -441,13 +449,21 @@ export function effectReport(input: EffectInput, deps: EffectDeps): EffectReport
   // ---------- 自动压缩阈值 ----------
   {
     const expected = preset.main.autoCompactWindow;
-    const w = settingsWritten(expected, ['autoCompactWindow'], decisions.find((t) => t.item === 'autoCompactWindow'));
+    const w = settingsWritten(
+      expected,
+      ['autoCompactWindow'],
+      decisions.find((t) => t.item === 'autoCompactWindow'),
+    );
     const sessionsSeen: CompactSample[] = [];
     for (const r of sessions.startedSince) {
       if (sessions.takenOverMain(r.sid, 'compact')) continue;
       const d = sessions.detail(r.sid);
-      if (!d || !d.summary.compactions.autoPreTokens.length) continue;
-      sessionsSeen.push({ sid: r.sid, at: d.summary.startedAt, preTokens: d.summary.compactions.autoPreTokens });
+      if (!d) continue;
+      // 阈值同时管主对话和全部子 agent（官方文档：Applies to both main conversations and subagents），子 agent 自己对话里的自动压缩也算
+      const sub = d.agents.filter((n) => n.kind === 'subagent').flatMap((n) => n.compactions.autoPreTokens);
+      const preTokens = [...d.summary.compactions.autoPreTokens, ...sub];
+      if (!preTokens.length) continue;
+      sessionsSeen.push({ sid: r.sid, at: d.summary.startedAt, preTokens, fromSubagents: sub.length });
     }
     const item = compactItem(T, expected, w, sessionsSeen, since, desktopOnly, settingsError);
     // 自动压缩关着：写了也没用
@@ -463,7 +479,11 @@ export function effectReport(input: EffectInput, deps: EffectDeps): EffectReport
   let advisorCallsSince = 0;
   {
     const expected = preset.advisor.model;
-    const w = settingsWritten(expected, ['advisorModel'], decisions.find((t) => t.item === 'advisorModel'));
+    const w = settingsWritten(
+      expected,
+      ['advisorModel'],
+      decisions.find((t) => t.item === 'advisorModel'),
+    );
     const samples: Sample[] = [];
     for (const r of sessions.startedSince) {
       if (sessions.takenOverMain(r.sid, 'advisor')) continue;
@@ -479,18 +499,30 @@ export function effectReport(input: EffectInput, deps: EffectDeps): EffectReport
       }
       samples.push({ sid: r.sid, at: d.summary.startedAt, value: annot ?? '（没有 advisor）', ok, weight: d.summary.advisorCalls });
     }
-    const { observed } = observedFrom(samples, expected, since, samples.reduce((n, s) => n + s.weight, 0));
+    const { observed } = observedFrom(
+      samples,
+      expected,
+      since,
+      samples.reduce((n, s) => n + s.weight, 0),
+    );
     observed.actual = observed.actual.filter((v) => v !== '（没有 advisor）');
     items.push(advisorItem(T, expected, w, observed, desktopOnly, settingsError));
   }
 
   // ---------- CLAUDE.md 规则 ----------
-  items.push(ruleItem(T, projectCwd === null ? path.join(configDir, 'CLAUDE.md') : projectClaudeMdPath(projectCwd), includeRule, ruleText as string | null | undefined, since, advisorCallsSince));
+  // 默认文字按方案生成（和 planner 一致）：项目方案叠加已保存的全局方案
+  {
+    const global = projectCwd === null ? null : (deps.ctx.globalPreset?.() ?? null);
+    const auto = { text: defaultRuleText(preset, global), summary: ruleSummary(preset, global) };
+    items.push(ruleItem(T, projectCwd === null ? path.join(configDir, 'CLAUDE.md') : projectClaudeMdPath(projectCwd), includeRule, ruleText as string | null | undefined, auto, since, advisorCallsSince));
+  }
 
   // ---------- 子 agent ----------
   const listing = loadedIndex(deps.store, sessions);
   for (const pa of preset.agents) {
     items.push(agentItem(T, pa, deps.ctx.knownCwds, projectCwd, sessions, listing, since));
+    // 往下派发的模型单独一项，紧跟在这个 agent 后面
+    if (typeof pa.dispatchModel === 'string') items.push(dispatchItem(T, pa.name, pa.dispatchModel, deps.ctx.knownCwds, projectCwd, sessions, since));
   }
 
   // ---------- 外部因素 ----------
@@ -536,9 +568,7 @@ function writtenSummary(label: string, expected: string | null, w: EffectWritten
       return `方案没有指定${spaced(label, true, false)}，但配置文件里还有 agentree 上次写入的 ${w.actual}，应用时会移除。`;
     case 'n/a':
       if (expected === null) {
-        return w.actual !== null
-          ? `方案没有指定${spaced(label, true, false)}。配置文件里现在是 ${w.actual}，不是 agentree 写的，不会动它。`
-          : `方案没有指定${spaced(label, true, false)}。`;
+        return w.actual !== null ? `方案没有指定${spaced(label, true, false)}。配置文件里现在是 ${w.actual}，不是 agentree 写的，不会动它。` : `方案没有指定${spaced(label, true, false)}。`;
       }
       return null;
     default:
@@ -565,12 +595,7 @@ function mainItem(
   const needsApply = w.state === 'no' || w.state === 'differs' || w.state === 'extra';
   if (expected !== null && !writeEffective) {
     // 最近的会话都来自桌面版：写配置文件对它没用（写不写都照实给 written），要在选择器里选
-    const tail =
-      observed.state === 'match'
-        ? T.desktopRecentMatch(expected)
-        : observed.state === 'mismatch'
-          ? T.desktopRecentMismatch(lastValue ?? '（未知）', expected)
-          : T.desktopNotSeen;
+    const tail = observed.state === 'match' ? T.desktopRecentMatch(expected) : observed.state === 'mismatch' ? T.desktopRecentMismatch(lastValue ?? '（未知）', expected) : T.desktopNotSeen;
     summary = text.desktop + tail;
     if (observed.state !== 'match') nextStep = text.pick(expected);
   } else {
@@ -584,14 +609,7 @@ function mainItem(
   return { key, kind, name: null, expected, written, loaded: NA_LOADED, observed, writeEffective, summary, nextStep };
 }
 
-function advisorItem(
-  T: EffectTexts,
-  expected: string | null,
-  w: EffectWritten & { owned: boolean },
-  observed: EffectObserved,
-  desktopOnly: boolean,
-  settingsError: string | null,
-): EffectItem {
+function advisorItem(T: EffectTexts, expected: string | null, w: EffectWritten & { owned: boolean }, observed: EffectObserved, desktopOnly: boolean, settingsError: string | null): EffectItem {
   const { owned: _o, ...written } = w;
   let summary: string;
   let nextStep: string | null = null;
@@ -605,9 +623,7 @@ function advisorItem(
   } else if (observed.state === 'match') {
     summary = observed.count > 0 ? T.advisorCalled(observed.count) : T.advisorNotCalled;
   } else if (observed.state === 'mismatch') {
-    summary = observed.actual.length
-      ? T.advisorMismatch(observed.actual.join('、'), expected!)
-      : T.advisorMissing;
+    summary = observed.actual.length ? T.advisorMismatch(observed.actual.join('、'), expected!) : T.advisorMissing;
   } else {
     summary = T.writtenNoSession;
   }
@@ -620,7 +636,10 @@ function advisorItem(
 interface CompactSample {
   sid: string;
   at: string | null;
+  /** 主对话和全部子 agent 的自动压缩 */
   preTokens: number[];
+  /** preTokens 里有几次发生在子 agent 的对话里；缺失当作 0 */
+  fromSubagents?: number;
 }
 
 /** 压缩前的 token 数落在阈值的 50% 到 105% 之间，算是"在阈值附近压缩" */
@@ -679,7 +698,12 @@ function compactItem(
     if ((w.state === 'no' || w.state === 'differs' || w.state === 'extra') && !settingsError) nextStep = T.applyHint;
   } else if (observed.state === 'mismatch') {
     // 只列超过阈值的那些值
-    const over = byFrequency(samples.flatMap((s) => s.preTokens).filter((n) => n > expected! * COMPACT_HIGH).map(preText));
+    const over = byFrequency(
+      samples
+        .flatMap((s) => s.preTokens)
+        .filter((n) => n > expected! * COMPACT_HIGH)
+        .map(preText),
+    );
     summary = T.compactMismatch(over.join('、'), x!);
   } else if (observed.state === 'match') {
     summary = T.compactMatch(observed.matched, observed.actual.join('、'));
@@ -690,6 +714,9 @@ function compactItem(
     summary = (desktopOnly ? T.compactDesktopUnverified : '') + T.compactNotReached;
     nextStep = T.compactWait(x!);
   }
+  // 有子 agent 里的样本时说一声，免得用户以为是主对话压缩的
+  const subCount = samples.reduce((n, s) => n + (s.fromSubagents ?? 0), 0);
+  if (ws === null && observed.count > 0 && subCount > 0) summary += T.compactSubagents(subCount);
   return {
     key: 'main.compact',
     kind: 'main-compact',
@@ -704,22 +731,38 @@ function compactItem(
   };
 }
 
-function ruleItem(T: EffectTexts, filePath: string, includeRule: boolean, ruleText: string | null | undefined, since: string | null, advisorCalls: number): EffectItem {
+/**
+ * CLAUDE.md 规则块。期望的文字：给了非空的自定义文字就是它，否则是按方案生成的 auto.text。
+ * 和 planner 一致：自动生成的为空（方案里既没有子 agent 也没有 advisor）时不需要规则块，文件里有的话应用时会删掉
+ */
+function ruleItem(
+  T: EffectTexts,
+  filePath: string,
+  includeRule: boolean,
+  ruleText: string | null | undefined,
+  auto: { text: string; summary: string },
+  since: string | null,
+  advisorCalls: number,
+): EffectItem {
   const f = readTextFile(filePath);
   const written: EffectWritten = { state: 'n/a', filePath, actual: null, diffs: [] };
+  const custom = typeof ruleText === 'string' && ruleText.trim() !== '';
+  const expectedText = effectiveRuleText(ruleText, auto.text);
+  const needed = includeRule && expectedText.trim() !== '';
   let summary: string;
   let nextStep: string | null = null;
   let error: string | null = null;
-  let hasBlock = false;
+  let block: string | null = null;
   if (f.exists && f.text === null) error = 'CLAUDE.md 不是 UTF-8 编码的文本';
   else if (f.text) {
     try {
-      hasBlock = findRuleBlock(f.text) !== null;
+      block = findRuleBlock(f.text)?.text ?? null;
     } catch (e) {
       if (!(e instanceof RuleBlockError)) throw e;
       error = e.message;
     }
   }
+  const hasBlock = block !== null;
   if (error) {
     written.state = 'differs';
     written.actual = '规则标记损坏';
@@ -727,20 +770,30 @@ function ruleItem(T: EffectTexts, filePath: string, includeRule: boolean, ruleTe
     nextStep = T.fixRuleMarkers;
   } else {
     written.actual = hasBlock ? '有规则块' : '没有规则块';
-    if (includeRule) {
+    if (needed) {
       if (!hasBlock) written.state = 'no';
-      else if (typeof ruleText === 'string') {
-        // 和 planner 一样：用这段文案重写规则块，结果和现在不同就是文案不一样
-        written.state = enableRule(f.text!, effectiveRuleText(ruleText)) === f.text ? 'yes' : 'differs';
-      } else written.state = 'yes';
+      else {
+        // 和 planner 一样：用期望的文字重写规则块，结果和现在不同就是文字不一样
+        written.state = enableRule(f.text!, expectedText) === f.text ? 'yes' : 'differs';
+        if (written.state === 'differs') {
+          // 早先版本写的块只有 advisor 规则，没有分工
+          const missingDivision = expectedText.includes(DIVISION_HEADING) && !block!.includes(DIVISION_HEADING);
+          written.diffs = [missingDivision ? '缺少分工规则' : '规则文字'];
+        }
+      }
     } else {
       written.state = hasBlock ? 'extra' : 'n/a';
     }
+    const missingDivision = written.diffs.includes('缺少分工规则');
     if (written.state === 'yes') summary = '已写入 CLAUDE.md。';
-    else if (written.state === 'no') summary = 'CLAUDE.md 里还没有 advisor 规则。';
-    else if (written.state === 'differs') summary = 'CLAUDE.md 里的规则文案和方案不一样。';
-    else if (written.state === 'extra') summary = '方案不包含规则，但 CLAUDE.md 里还有 agentree 的规则块，应用时会移除。';
-    else summary = '方案不包含规则。';
+    else if (written.state === 'no') summary = auto.summary.includes('分工') && !custom ? 'CLAUDE.md 里还没有分工规则，主会话可能不会主动派发子 agent。' : 'CLAUDE.md 里还没有 agentree 的规则。';
+    else if (written.state === 'differs')
+      summary = missingDivision ? 'CLAUDE.md 里的规则块是旧版本写的，只有 advisor 规则、没有分工规则，主会话可能不会主动派发子 agent。' : 'CLAUDE.md 里的规则文字和方案不一样。';
+    else if (written.state === 'extra')
+      summary = includeRule
+        ? '方案里既没有子 agent 也没有 advisor，不需要规则，但 CLAUDE.md 里还有 agentree 的规则块，应用时会移除。'
+        : '方案不包含规则，但 CLAUDE.md 里还有 agentree 的规则块，应用时会移除。';
+    else summary = includeRule ? '方案里既没有子 agent 也没有 advisor，不需要写规则。' : '方案不包含规则。';
     if (written.state === 'no' || written.state === 'differs' || written.state === 'extra') nextStep = T.applyHint;
     if (written.state === 'yes' && advisorCalls > 0) summary += T.ruleAdvisorCalls(advisorCalls);
   }
@@ -748,7 +801,7 @@ function ruleItem(T: EffectTexts, filePath: string, includeRule: boolean, ruleTe
     key: 'rule',
     kind: 'rule',
     name: null,
-    expected: includeRule ? (typeof ruleText === 'string' ? '有规则块（自定义文案）' : '有规则块') : null,
+    expected: needed ? (custom ? '有规则块（自定义文字）' : `有规则块（${auto.summary}）`) : null,
     written,
     loaded: NA_LOADED,
     observed: observedNA(since),
@@ -771,9 +824,13 @@ interface ListingIndex {
 
 /** 读 agent_listings：起点之后有清单记录（加入或移除）的会话，以及这些会话里加入过的类型 */
 function loadedIndex(store: Store, sessions: Sessions): ListingIndex {
-  const rows = store.db
-    .prepare('SELECT session_id AS sid, agent_type AS type, first_added_at AS first, last_added_at AS last, removed_at AS removed FROM agent_listings')
-    .all() as Array<{ sid: string; type: string; first: string | null; last: string | null; removed: string | null }>;
+  const rows = store.db.prepare('SELECT session_id AS sid, agent_type AS type, first_added_at AS first, last_added_at AS last, removed_at AS removed FROM agent_listings').all() as Array<{
+    sid: string;
+    type: string;
+    first: string | null;
+    last: string | null;
+    removed: string | null;
+  }>;
   const activeSids = new Set<string>();
   for (const r of rows) {
     if (!sessions.has(r.sid)) continue; // 不在统计范围内（项目方案只看这个项目的会话）
@@ -790,15 +847,7 @@ function loadedIndex(store: Store, sessions: Sessions): ListingIndex {
   return { byType, any: activeSids.size > 0, activity: sessions.hasActivity() };
 }
 
-function agentItem(
-  T: EffectTexts,
-  pa: PresetAgent,
-  knownCwds: string[],
-  projectCwd: string | null,
-  sessions: Sessions,
-  listing: ListingIndex,
-  since: string | null,
-): EffectItem {
+function agentItem(T: EffectTexts, pa: PresetAgent, knownCwds: string[], projectCwd: string | null, sessions: Sessions, listing: ListingIndex, since: string | null): EffectItem {
   const builtin = isBuiltin(pa.name);
   const expected = [pa.model !== null ? `model ${pa.model}` : null, pa.effort !== null ? `effort ${pa.effort}` : null].filter(Boolean).join('，') || null;
   const written: EffectWritten = { state: 'n/a', filePath: null, actual: null, diffs: [] };
@@ -817,7 +866,8 @@ function agentItem(
         try {
           // 和 preset.apply 用同一个函数：改动的字段就是不一致的字段
           const doc = parseAgentDoc(f.text, f.bom);
-          const { keys } = applyPresetAgent(doc, pa);
+          // 指定了往下派发的模型时由单独的 agent-dispatch 项检查，这里不重复算；null（要删块）仍算在这一项里
+          const { keys } = applyPresetAgent(doc, typeof pa.dispatchModel === 'string' ? { ...pa, dispatchModel: undefined } : pa);
           const cur = parseAgentDoc(f.text, f.bom);
           const field = (k: string) => cur.fields.find((x) => x.key === k)?.value ?? null;
           written.actual = `model ${field('model') ?? '未指定'}，effort ${field('effort') ?? '未指定'}`;
@@ -849,9 +899,7 @@ function agentItem(
       const ec = checkEffort(pa.effort, n.efforts);
       const passes = (c: { level: string } | null) => !c || c.level === 'ok' || c.level === 'info';
       const ok = passes(mc) && passes(ec);
-      const bad = ok
-        ? null
-        : [!passes(mc) ? n.primaryModel ?? '未知模型' : null, !passes(ec) ? `effort ${n.efforts.join('/')}` : null].filter(Boolean).join('，');
+      const bad = ok ? null : [!passes(mc) ? (n.primaryModel ?? '未知模型') : null, !passes(ec) ? `effort ${n.efforts.join('/')}` : null].filter(Boolean).join('，');
       dispatches.push({ sid: r.sid, at: n.startedAt, model: n.primaryModel, efforts: n.efforts, ok, bad });
     }
   }
@@ -930,6 +978,117 @@ function agentItem(
     expected,
     written,
     loaded,
+    observed,
+    writeEffective: true,
+    summary,
+    nextStep,
+  };
+}
+
+// ---------------- 往下派发的模型 ----------------
+
+/**
+ * 一个 agent 往下派发子 agent 时有没有按方案传 model 参数（PresetAgent.dispatchModel 为字符串时才有这一项）。
+ * written 看定义文件正文末尾的派发块，observed 看起点之后它作为父节点派发出去的子节点的 requestedModel
+ */
+function dispatchItem(T: EffectTexts, name: string, expected: string, knownCwds: string[], projectCwd: string | null, sessions: Sessions, since: string | null): EffectItem {
+  const builtin = isBuiltin(name);
+  const written: EffectWritten = { state: 'n/a', filePath: null, actual: null, diffs: [] };
+  let writtenNote: string | null = null;
+  let cannot = false;
+  if (!builtin) {
+    try {
+      validateAgentName(name);
+      const target = findAgentFile(name, knownCwds, projectCwd);
+      written.filePath = target.path;
+      const f = readTextFile(target.path);
+      if (!f.exists) written.state = 'no';
+      else if (f.text === null) {
+        written.state = 'differs';
+        writtenNote = '定义文件不是 UTF-8 编码的文本，agentree 不会修改它。';
+      } else {
+        try {
+          const doc = parseAgentDoc(f.text, f.bom);
+          const cur = parseDispatch(promptOf(doc)).model;
+          written.actual = cur;
+          if (cur === null) written.state = 'no';
+          else if (cur === expected) written.state = 'yes';
+          else {
+            written.state = 'differs';
+            written.diffs = [`文件里是 ${cur}，方案是 ${expected}`];
+          }
+          cannot = !canDispatch(getField(doc, 'tools'), getField(doc, 'disallowedTools'));
+        } catch (e) {
+          written.state = 'differs';
+          writtenNote = `定义文件的 frontmatter 格式异常（${(e as Error).message}），agentree 不会修改它，请手动处理。`;
+        }
+      }
+    } catch (e) {
+      if (!(e instanceof PathError)) throw e;
+      written.state = 'no';
+      writtenNote = e.message;
+    }
+  }
+
+  // observed：起点之后开始运行的、父节点类型是这个名字的子节点，看派发时传的 model 参数
+  const NONE = '没指定';
+  const seen: Array<{ sid: string; at: string | null; value: string; ok: boolean }> = [];
+  for (const r of sessions.activeSince) {
+    // 全局方案：会话所属的项目方案里有同名 agent 时，那个 agent 用的是项目的定义，不计入
+    if (sessions.takenOverAgent(r.sid, name)) continue;
+    const d = sessions.detail(r.sid);
+    if (!d) continue;
+    const byId = new Map(d.agents.map((n) => [n.id, n]));
+    for (const n of d.agents) {
+      if (n.kind !== 'subagent' || n.parentId === null || !sessions.after(n.startedAt)) continue;
+      const parent = byId.get(n.parentId);
+      if (!parent || parent.kind !== 'subagent' || !sameType(parent.agentType, name)) continue;
+      const ok = n.requestedModel !== null && sameDispatchModel(expected, n.requestedModel);
+      seen.push({ sid: r.sid, at: n.startedAt, value: n.requestedModel ?? NONE, ok });
+    }
+  }
+  seen.sort((a, b) => (tsMs(a.at) ?? 0) - (tsMs(b.at) ?? 0));
+  const last = seen[seen.length - 1] ?? null;
+  const matched = seen.filter((x) => x.ok).length;
+  const bad = byFrequency(seen.filter((x) => !x.ok).map((x) => x.value));
+  const observed: EffectObserved = {
+    state: last === null ? 'not-seen' : matched === seen.length ? 'match' : 'mismatch',
+    since,
+    count: seen.length,
+    matched,
+    // 出现过的全部取值，不符合的排在前面
+    actual: [...bad, ...byFrequency(seen.map((x) => x.value)).filter((v) => !bad.includes(v))],
+    lastSeenAt: last?.at ?? null,
+    lastSessionId: last?.sid ?? null,
+  };
+
+  let summary: string;
+  let nextStep: string | null = null;
+  if (builtin) {
+    summary = T.dispatchBuiltin(name);
+  } else if (written.state === 'no') {
+    summary = writtenNote ? `还没有写入：${writtenNote}` : T.dispatchNotWritten;
+    if (!writtenNote) nextStep = T.applyHint;
+  } else if (written.state === 'differs') {
+    summary = writtenNote ?? T.dispatchDiffers(written.actual ?? '（空）', expected);
+    if (!writtenNote) nextStep = T.applyHint;
+  } else if (observed.state === 'match') {
+    summary = T.dispatchMatch(observed.count, expected);
+  } else if (observed.state === 'mismatch') {
+    summary = T.dispatchMismatch(observed.count, observed.count - matched, bad.join('、'), expected);
+    nextStep = T.dispatchStricter;
+  } else {
+    summary = T.dispatchNotSeen;
+    nextStep = T.dispatchWait;
+  }
+  if (cannot && !builtin) summary += T.dispatchCannot;
+  return {
+    key: `agent:${name}:dispatch`,
+    kind: 'agent-dispatch',
+    name,
+    expected,
+    written,
+    loaded: NA_LOADED,
     observed,
     writeEffective: true,
     summary,

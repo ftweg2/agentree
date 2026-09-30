@@ -87,7 +87,7 @@ test('从 v3 升级：日志还在的文件重读补上清单，不重复计数�
   raw.close();
 
   store = new Store(dbPath);
-  assert.equal((store.db.prepare('PRAGMA user_version').get() as any).user_version, 5);
+  assert.equal((store.db.prepare('PRAGMA user_version').get() as any).user_version, 6);
   const files = store.db.prepare('SELECT path, offset, size, present FROM files').all().map((r) => ({ ...r })) as any[];
   for (const f of files.filter((x) => x.present === 1)) assert.deepEqual([f.offset, f.size], [0, -1], `${f.path} 重置读取进度`);
   assert.deepEqual(files.find((f) => f.path === 'gone.jsonl'), { path: 'gone.jsonl', offset: 500, size: 500, present: 0 }, '已清理的文件不动');
